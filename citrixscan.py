@@ -8,8 +8,8 @@
 ║                                                                            ║
 ║  Author  : NetGuard 24/7 LLC (netguard24-7.com)                           ║
 ║  License : MIT                                                             ║
-║  Version : 1.0.0                                                           ║
-║  Date    : 2026-03-24                                                      ║
+║  Version : 1.0.1                                                           ║
+║  Date    : 2026-03-25                                                      ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 
 CAPABILITIES:
