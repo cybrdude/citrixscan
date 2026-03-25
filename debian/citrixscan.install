@@ -1,0 +1,2 @@
+citrixscan.py usr/share/citrixscan/
+debian/helper-script/citrixscan usr/bin/

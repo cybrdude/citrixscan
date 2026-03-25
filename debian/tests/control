@@ -1,0 +1,31 @@
+Source: citrixscan
+Section: net
+Priority: optional
+Maintainer: NetGuard 24/7 LLC <dev@netguard24-7.com>
+Build-Depends: debhelper-compat (= 13)
+Standards-Version: 4.6.2
+Homepage: https://github.com/cybrdude/citrixscan
+Vcs-Browser: https://github.com/cybrdude/citrixscan
+Vcs-Git: https://github.com/cybrdude/citrixscan.git
+Rules-Requires-Root: no
+
+Package: citrixscan
+Architecture: all
+Depends: ${misc:Depends}, python3
+Description: Full-scope external security scanner for Citrix NetScaler ADC/Gateway
+ CitrixScan performs comprehensive, non-exploitative security assessments
+ of internet-facing Citrix NetScaler appliances. It identifies firmware
+ versions using 10 detection vectors (including GZIP timestamp extraction),
+ maps them against 25 known CVEs (2019-2026), detects indicators of
+ compromise from known webshell campaigns, audits for security
+ misconfigurations, and checks TLS/cipher configurations.
+ .
+ Features:
+  - 228-entry GZIP timestamp fingerprint database
+  - 25 CVEs with version-to-fix mapping and config prerequisite checks
+  - IoC detection for CVE-2023-3519 webshell campaigns (CISA AA23-201A)
+  - Misconfiguration audit with login-page false positive filtering
+  - TLS/cipher audit and security header checks
+  - JSON, CSV, and Markdown report export
+ .
+ Single file, zero external dependencies, production-safe.

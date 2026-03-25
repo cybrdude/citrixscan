@@ -1,0 +1,11 @@
+citrixscan (1.0.0-0kali1) kali-dev; urgency=medium
+
+  * Initial release
+  * 25 CVE database (2019-2026) with version-to-fix mapping
+  * 10 version fingerprinting vectors including GZIP timestamp extraction
+  * IoC detection for known webshell campaigns
+  * Misconfiguration audit with login-page false positive filtering
+  * TLS audit and security header checks
+  * JSON, CSV, and Markdown report export
+
+ -- NetGuard 24/7 LLC <dev@netguard24-7.com>  Tue, 25 Mar 2026 01:00:00 +0000

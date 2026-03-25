@@ -1,0 +1,85 @@
+.TH CITRIXSCAN 1 "March 2026" "1.0.0" "CitrixScan Manual"
+.SH NAME
+citrixscan \- full-scope external security scanner for Citrix NetScaler ADC/Gateway
+.SH SYNOPSIS
+.B citrixscan
+.RI [ targets ]
+.RI [ options ]
+.SH DESCRIPTION
+.B citrixscan
+performs comprehensive, non-exploitative security assessments of
+internet-facing Citrix NetScaler ADC and NetScaler Gateway appliances.
+.PP
+It identifies firmware versions using 10 detection vectors, maps them
+against 25 known CVEs (2019\-2026), detects indicators of compromise,
+audits for security misconfigurations, and checks TLS configurations.
+.PP
+All checks are unauthenticated and production-safe. No payloads are sent.
+.SH OPTIONS
+.TP
+.B targets
+Target IPs or hostnames (space-separated).
+.TP
+.BR \-f ", " \-\-file " " \fIFILE\fR
+Read targets from file (one per line, # for comments).
+.TP
+.BR \-p ", " \-\-port " " \fIPORT\fR
+HTTPS port (default: 443).
+.TP
+.BR \-t ", " \-\-timeout " " \fISEC\fR
+Timeout per request in seconds (default: 15).
+.TP
+.BR \-\-threads " " \fIN\fR
+Concurrent scan threads (default: 5).
+.TP
+.BR \-o ", " \-\-output\-json " " \fIFILE\fR
+Write JSON report to FILE.
+.TP
+.BR \-\-csv " " \fIFILE\fR
+Write CSV report to FILE.
+.TP
+.BR \-\-markdown " " \fIFILE\fR
+Write Markdown report to FILE.
+.TP
+.BR \-v ", " \-\-verbose
+Verbose output (paths, ETags, TLS details, security headers).
+.TP
+.BR \-\-modules " " \fILIST\fR
+Comma-separated scan modules: all, cve, ioc, misconfig, tls, headers (default: all).
+.TP
+.BR \-\-no\-deep
+Skip EPA binary download for faster scanning.
+.TP
+.BR \-\-list\-cves
+Print the CVE database and exit.
+.TP
+.BR \-\-version
+Print version and exit.
+.SH EXAMPLES
+.TP
+Scan a single target:
+.B citrixscan 10.0.0.1 -v
+.TP
+Multiple targets with reports:
+.B citrixscan 10.0.0.1 10.0.0.2 -o report.json --csv report.csv
+.TP
+Bulk scan from file:
+.B citrixscan -f targets.txt --threads 10 -o results.json
+.TP
+List CVE database:
+.B citrixscan --list-cves
+.SH EXIT STATUS
+.TP
+.B 0
+Scan completed successfully.
+.TP
+.B 1
+Error in arguments or target file not found.
+.SH AUTHOR
+NetGuard 24/7 LLC <dev@netguard24-7.com>
+.SH SEE ALSO
+.BR nmap (1),
+.BR nuclei (1),
+.BR nikto (1)
+.SH LICENSE
+MIT License. See /usr/share/doc/citrixscan/copyright for details.
