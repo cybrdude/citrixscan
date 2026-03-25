@@ -1,0 +1,26 @@
+# Reports
+*.json
+*.csv
+report.md
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Target lists (may contain sensitive IPs)
+targets.txt
+*.targets
