@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║                    CitrixScan - NetScaler Security Scanner                  ║
-║                                                                            ║
-║  Comprehensive external security assessment for Citrix NetScaler ADC       ║
-║  and NetScaler Gateway appliances.                                         ║
-║                                                                            ║
-║  Author  : NetGuard 24/7 LLC (netguard24-7.com) & Contributors                          ║
-║  License : MIT                                                             ║
-║  Version : 1.0.1                                                           ║
-║  Date    : 2026-03-30                                                      ║
+║                    CitrixScan - NetScaler Security Scanner                   ║
+║                                                                              ║
+║  Comprehensive external security assessment for Citrix NetScaler ADC         ║
+║  and NetScaler Gateway appliances.                                           ║
+║                                                                              ║
+║  Author  : NetGuard 24/7 LLC (netguard24-7.com) & Contributors               ║
+║  License : MIT                                                               ║
+║  Version : 1.0.1                                                             ║
+║  Date    : 2026-03-30                                                        ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 
 CAPABILITIES:
