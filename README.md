@@ -6,7 +6,7 @@ Non-exploitative. Zero dependencies. Single file. Production-safe.
 
 ```
   ░█▀▀░▀█▀░▀█▀░█▀▄░▀█▀░█░█░█▀▀░█▀▀░█▀█░█▀█
-  ░█░░░░█░░░█░░█▀▄░░█░░▄▀▄░▀▀█░█░░░█▀█░█░█   v1.0.0
+  ░█░░░░█░░░█░░█▀▄░░█░░▄▀▄░▀▀█░█░░░█▀█░█░█   v1.0.1
   ░▀▀▀░▀▀▀░░▀░░▀░▀░▀▀▀░▀░▀░▀▀▀░▀▀▀░▀░▀░▀░▀
 
   NetScaler Security Scanner     NetGuard 24/7 LLC
@@ -293,7 +293,7 @@ Contributions welcome via pull request:
 - [**Fox-IT Security Research Team**](https://github.com/fox-it/citrix-netscaler-triage) — GZIP timestamp fingerprinting technique and version lookup table
 - [**CISA**](https://www.cisa.gov/news-events/cybersecurity-advisories/aa23-201a) — IoC indicators from Advisory AA23-201A
 - **Rapid7**, **Arctic Wolf**, **watchTowr** — CVE analysis and advisory context
-
+- [**tijldeneut**](https://github.com/tijldeneut/Security/blob/master/Fingerprinters/CitrixNS-fingerprinter.py) — Citrix NetScaler fingerprinting script
 ---
 
 ## Disclaimer
