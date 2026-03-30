@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║                    CitrixScan - NetScaler Security Scanner                  ║
-║                                                                            ║
-║  Comprehensive external security assessment for Citrix NetScaler ADC       ║
-║  and NetScaler Gateway appliances.                                         ║
-║                                                                            ║
-║  Author  : NetGuard 24/7 LLC (netguard24-7.com)                           ║
-║  License : MIT                                                             ║
-║  Version : 1.0.0                                                           ║
-║  Date    : 2026-03-24                                                      ║
+║                    CitrixScan - NetScaler Security Scanner                   ║
+║                                                                              ║
+║  Comprehensive external security assessment for Citrix NetScaler ADC         ║
+║  and NetScaler Gateway appliances.                                           ║
+║                                                                              ║
+║  Author  : NetGuard 24/7 LLC (netguard24-7.com) & Contributors               ║
+║  License : MIT                                                               ║
+║  Version : 1.0.1                                                             ║
+║  Date    : 2026-03-30                                                        ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 
 CAPABILITIES:
@@ -40,8 +40,8 @@ DISCLAIMER:
   no liability for misuse.
 """
 
-__version__ = "1.0.0"
-__author__ = "NetGuard 24/7 LLC"
+__version__ = "1.0.1"
+__author__ = "NetGuard 24/7 LLC & Contributors"
 __license__ = "MIT"
 
 import argparse
@@ -985,7 +985,9 @@ def detect_config(responses: list, paths_tried: dict) -> dict:
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  GZIP TIMESTAMP → VERSION MAPPING (Fox-IT technique)
-#  Source: https://github.com/fox-it/citrix-netscaler-triage
+#  Sources:
+#    https://github.com/fox-it/citrix-netscaler-triage
+#    https://github.com/tijldeneut/Security/blob/master/Fingerprinters/CitrixNS-fingerprinter.py
 #  Blog: https://blog.fox-it.com/2022/12/28/cve-2022-27510-cve-2022-27518-measuring-citrix-adc-gateway-version-adoption-on-the-internet/
 #
 #  The file /vpn/js/rdx/core/lang/rdx_en.json.gz contains a GZIP MTIME
@@ -1063,13 +1065,17 @@ RDX_EN_STAMP_TO_VERSION = {
     1749564145: "12.1-55.328", 1749572802: "13.1-37.235", 1749588747: "13.1-58.32",
     1750134083: "12.1-55.328", 1750251851: "13.1-59.19", 1755692465: "12.1-55.330",
     1755692615: "14.1-47.48", 1755693334: "13.1-37.241", 1755693886: "13.1-59.22",
-    1756174950: "12.1-55.330", 1756797107: "14.1-51.72", 1756913056: "13.1-55.34",
+    1756174950: "12.1-55.330", 1756797107: "14.1-51.72", 1756913056: "13.1-60.26",
     1757152960: "14.1-51.80", 1758266399: "13.1-37.247", 1758461041: "14.1-55.19",
-    1758807975: "13.1-60.29", 1760420084: "14.1-55.23", 1760504854: "14.1-51.83",
+    1758481087: "13.1-60.29", 1758572828: "14.1-51.80", 1758807975: "13.1-60.29",
+    1760420084: "14.1-55.23", 1760504854: "14.1-51.83", 1760549260: "14.1-56.71",
     1760855527: "13.1-60.30", 1761072485: "13.1-37.259", 1761086178: "14.1-55.80",
     1761126430: "13.1-62.16", 1761218816: "14.1-62.16", 1761741652: "13.1-37.262",
-    1761746770: "14.1-62.20", 1762297523: "13.1-62.23", 1762299316: "14.1-66.59",
-    1762655407: "14.1-56.74", 1762663520: "13.1-61.23", 1762830097: "12.1-55.333",
+    1761746770: "14.1-62.20", 1761935980: "13.1-60.32", 1762297523: "13.1-62.23",
+    1762299316: "14.1-66.59", 1762655407: "14.1-56.74", 1762663520: "13.1-61.23",
+    1762830097: "12.1-55.333", 1764257490: "13.1-61.25", 1764788389: "14.1-60.52",
+    1768287554: "14.1-60.57", 1768297927: "13.1-61.26", 1771909221: "14.1-66.54",
+    1773036148: "13.1-62.23", 1773588193: "14.1-60.58", 1773758251: "14.1-66.59",
 }
 
 
