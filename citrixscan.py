@@ -6,7 +6,7 @@
 ║  Comprehensive external security assessment for Citrix NetScaler ADC         ║
 ║  and NetScaler Gateway appliances.                                           ║
 ║                                                                              ║
-║  Author  : NetGuard 24/7 LLC (netguard24-7.com) & Contributors               ║
+║  Author  : NetGuard 24/7 LLC (netguard24-7.com) & Open Source Contributors   ║
 ║  License : MIT                                                               ║
 ║  Version : 1.0.1                                                             ║
 ║  Date    : 2026-03-30                                                        ║
@@ -41,7 +41,7 @@ DISCLAIMER:
 """
 
 __version__ = "1.0.1"
-__author__ = "NetGuard 24/7 LLC & Contributors"
+__author__ = "NetGuard 24/7 LLC & Open Source Contributors"
 __license__ = "MIT"
 
 import argparse
@@ -880,6 +880,7 @@ class ScanResult:
     # Config detection
     saml_idp_detected: bool = False
     saml_sp_detected: bool = False
+    oauth_idp_detected: bool = False
     gateway_detected: bool = False
     aaa_detected: bool = False
     mgmt_exposed: bool = False
@@ -937,10 +938,15 @@ def detect_config(responses: list, paths_tried: dict) -> dict:
     """Detect appliance configuration from accessible endpoints."""
     config = {
         "saml_idp": False, "saml_sp": False, "gateway": False,
-        "aaa": False, "mgmt_exposed": False, "pcoip": False,
+        "aaa": False, "mgmt_exposed": False, "pcoip": False, "oauth_idp": False,
     }
-    saml_idp_paths = ["/saml/login", "/metadata/saml/idp",
-                      "/oauth/idp/.well-known/openid-configuration", "/cgi/samlauth"]
+    # SAML IDP indicators — these are SAML-specific endpoints only.
+    # NOTE: /oauth/idp/.well-known/openid-configuration is an OAuth/OIDC endpoint,
+    # NOT a SAML IDP endpoint. OAuth IdP and SAML IdP are separate configurations
+    # on NetScaler. CVE-2026-3055 requires SAML IDP specifically.
+    # Credit: tijldeneut for identifying this false positive vector.
+    saml_idp_paths = ["/saml/login", "/metadata/saml/idp", "/cgi/samlauth"]
+    oauth_idp_paths = ["/oauth/idp/.well-known/openid-configuration"]
     gw_paths = ["/vpn/index.html", "/logon/LogonPoint/index.html", "/cgi/login",
                 "/nf/auth/doAuthentication.do", "/vpn/tmindex.html"]
     mgmt_paths = ["/menu/neo", "/menu/ss", "/gui/",
@@ -949,8 +955,17 @@ def detect_config(responses: list, paths_tried: dict) -> dict:
     for p in saml_idp_paths:
         resp = paths_tried.get(p)
         if resp and resp["status"] in (200, 301, 302, 307, 401, 403):
-            config["saml_idp"] = True
-            break
+            body = resp.get("body", "")
+            if not is_login_page(body):
+                config["saml_idp"] = True
+                break
+    for p in oauth_idp_paths:
+        resp = paths_tried.get(p)
+        if resp and resp["status"] == 200:
+            body = resp.get("body", "")
+            # Verify it's actual OIDC JSON, not a login page redirect
+            if not is_login_page(body) and ("issuer" in body or "authorization_endpoint" in body):
+                config["oauth_idp"] = True
     for p in gw_paths:
         resp = paths_tried.get(p)
         if resp and resp["status"] in (200, 301, 302, 307, 401):
@@ -1687,6 +1702,7 @@ def scan_target(target: str, port: int = 443, timeout: int = 15,
     config = detect_config(responses + extended_responses, paths_tried)
     result.saml_idp_detected = config["saml_idp"]
     result.saml_sp_detected = config.get("saml_sp", False)
+    result.oauth_idp_detected = config.get("oauth_idp", False)
     result.gateway_detected = config["gateway"]
     result.aaa_detected = config.get("aaa", False)
     result.mgmt_exposed = config["mgmt_exposed"]
@@ -1795,7 +1811,8 @@ def print_result(r: ScanResult, verbose: bool = False):
     # Config
     print(f"\n  {B}Configuration:{R}")
     flags = [
-        ("SAML IDP", r.saml_idp_detected), ("Gateway/VPN", r.gateway_detected),
+        ("SAML IDP", r.saml_idp_detected), ("OAuth IdP", r.oauth_idp_detected),
+        ("Gateway/VPN", r.gateway_detected),
         ("AAA vServer", r.aaa_detected), ("Mgmt Exposed", r.mgmt_exposed),
         ("EPA Available", r.epa_available), ("NITRO API", r.nitro_accessible),
     ]
@@ -1940,7 +1957,7 @@ def export_csv(results: list, filepath: str):
     fields = [
         "target", "ip", "port", "reachable", "is_netscaler", "version_display",
         "branch", "eol", "version_source", "version_confidence",
-        "saml_idp_detected", "gateway_detected", "aaa_detected", "mgmt_exposed",
+        "saml_idp_detected", "oauth_idp_detected", "gateway_detected", "aaa_detected", "mgmt_exposed",
         "tls_protocol", "tls_cipher", "tls_bits",
         "total_vulns", "critical_cves", "high_cves", "exploited_itw_vulns",
         "ioc_count", "misconfig_count", "risk_rating", "recommendations",
@@ -1983,6 +2000,7 @@ def export_markdown(results: list, filepath: str):
             f.write(f"- **Version:** {r.version_display or 'Unknown'}\n")
             f.write(f"- **Branch:** {r.branch or 'N/A'} {'(EOL)' if r.eol else ''}\n")
             f.write(f"- **SAML IDP:** {'Yes' if r.saml_idp_detected else 'No'}\n")
+            f.write(f"- **OAuth IdP:** {'Yes' if r.oauth_idp_detected else 'No'}\n")
             f.write(f"- **Gateway:** {'Yes' if r.gateway_detected else 'No'}\n")
             f.write(f"- **CVEs:** {r.total_vulns} ({r.critical_cves} critical, {r.exploited_itw_vulns} exploited-ITW)\n\n")
 
