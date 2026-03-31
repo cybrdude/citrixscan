@@ -1,18 +1,6 @@
 # CitrixScan
 
 **Full-scope external security scanner for Citrix NetScaler ADC and NetScaler Gateway appliances.**
-
-Non-exploitative. Zero dependencies. Single file. Production-safe.
-
-```
-  ░█▀▀░▀█▀░▀█▀░█▀▄░▀█▀░█░█░█▀▀░█▀▀░█▀█░█▀█
-  ░█░░░░█░░░█░░█▀▄░░█░░▄▀▄░▀▀█░█░░░█▀█░█░█   v1.0.1
-  ░▀▀▀░▀▀▀░░▀░░▀░▀░▀▀▀░▀░▀░▀▀▀░▀▀▀░▀░▀░▀░▀
-
-  NetScaler Security Scanner     NetGuard 24/7 LLC
-  25 CVEs  |  10 Fingerprint Vectors  |  IoC Detection
-```
-
 ---
 
 ## What It Does
