@@ -2,6 +2,17 @@
 
 All notable changes to CitrixScan will be documented in this file.
 
+## 2026-10-01
+
+### CVE-2026-88771
+
+- Added version-based detection for the unauthenticated remote code execution vulnerability in customer-managed NetScaler ADC and NetScaler Gateway, including default configurations.
+- Added fixed-build thresholds for 14.1, 13.1, 14.1-FIPS, and 13.1-FIPS/NDcPP, with a reminder to verify the appliance edition when an external scan cannot identify it.
+- Marked the CVE as exploited in the wild, as reported in [Citrix bulletin CTX697096](https://support.citrix.com/external/article/CTX697096/netscaler-adc-and-netscaler-gateway-secu.html).
+- Continued version checks after an unrecognized GZIP timestamp and retained FIPS/NDcPP edition markers in version responses.
+- Included detected CVE IDs in CSV reports and flagged edition uncertainty when build thresholds differ.
+- Listed older CVEs without FIPS/NDcPP fix mappings as unassessed instead of applying standard-release thresholds.
+
 ## [1.0.0] - 2026-03-25
 
 ### Initial Release

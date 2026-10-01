@@ -5,14 +5,14 @@
 
 ## What It Does
 
-CitrixScan performs a comprehensive, non-exploitative security assessment of internet-facing Citrix NetScaler appliances. It identifies the firmware version, maps it against 25 known CVEs spanning 2019–2026, detects vulnerable configurations, checks for indicators of compromise, and audits TLS and security headers — all without authentication.
+CitrixScan performs a comprehensive, non-exploitative security assessment of internet-facing Citrix NetScaler appliances. It identifies the firmware version, maps it against 26 known CVEs spanning 2019–2026, detects vulnerable configurations, checks for indicators of compromise, and audits TLS and security headers — all without authentication.
 
 ### Scan Modules
 
 | Module | What It Checks |
 |---|---|
 | **Version Fingerprinting** | 10 detection vectors including GZIP timestamp extraction (Fox-IT technique), NITRO API probing, EPA binary PE analysis, HTTP header parsing, and static resource hashing |
-| **CVE Assessment** | 25 CVEs with version-to-fix mapping, configuration prerequisite validation, in-the-wild exploitation tracking, and public PoC status |
+| **CVE Assessment** | 26 CVEs with version-to-fix mapping, configuration prerequisite validation, in-the-wild exploitation tracking, and public PoC status |
 | **IoC Detection** | 15 known webshell/backdoor paths from CVE-2023-3519 campaigns, CISA AA23-201A indicators, with content-based analysis that distinguishes stock NetScaler files from actual implants |
 | **Misconfiguration Audit** | 12 paths checked for exposed management interfaces, unauthenticated NITRO API access, configuration file exposure, and diagnostic data leaks — with login-page false positive filtering |
 | **TLS Audit** | Protocol version, cipher strength, deprecated cipher detection, certificate expiry |
@@ -62,6 +62,7 @@ CitrixScan embeds a **228-entry lookup table** mapping known timestamps to exact
 Credit: [Fox-IT Security Research Team](https://blog.fox-it.com/2022/12/28/cve-2022-27510-cve-2022-27518-measuring-citrix-adc-gateway-version-adoption-on-the-internet/)
 
 **Known limitation:** Some builds compress this file with `gzip -n`, which zeroes out the MTIME field. In those cases, the scanner falls through to other detection vectors.
+An MTIME that is absent from the lookup table also falls through to other version sources. If no source identifies the build, the report keeps the version unknown and asks for appliance verification.
 
 ### 2. NITRO API
 
@@ -99,7 +100,7 @@ VERSION UNKNOWN: Authenticate and run 'show ns version' to confirm patch status.
 
 ## CVE Database
 
-25 CVEs spanning 2019–2026. Each entry includes CVSS score, affected version ranges, fixed versions per branch, configuration prerequisites, in-the-wild exploitation status, and public PoC availability.
+26 CVEs spanning 2019–2026. Each entry includes CVSS score, affected version ranges, fixed versions per branch, configuration prerequisites, in-the-wild exploitation status, and public PoC availability.
 
 | CVE | CVSS | Severity | Name | ITW | PoC |
 |---|---|---|---|---|---|
@@ -107,6 +108,7 @@ VERSION UNKNOWN: Authenticate and run 'show ns version' to confirm patch status.
 | CVE-2022-27510 | 9.8 | CRITICAL | Authentication Bypass | 🔥 | ⚡ |
 | CVE-2022-27518 | 9.8 | CRITICAL | Unauthenticated RCE (SAML) | 🔥 | ⚡ |
 | CVE-2023-3519 | 9.8 | CRITICAL | Unauthenticated RCE (Stack Overflow) | 🔥 | ⚡ |
+| CVE-2026-88771 | 9.5 | CRITICAL | Unauthenticated RCE (Improper Input Validation) | 🔥 | |
 | CVE-2023-4966 | 9.4 | CRITICAL | CitrixBleed | 🔥 | ⚡ |
 | CVE-2025-5777 | 9.3 | CRITICAL | CitrixBleed 2 | 🔥 | ⚡ |
 | CVE-2026-3055 | 9.3 | CRITICAL | Memory Overread (SAML IDP) | | |
@@ -133,9 +135,23 @@ VERSION UNKNOWN: Authenticate and run 'show ns version' to confirm patch status.
 
 Run `python3 citrixscan.py --list-cves` for the full interactive table.
 
+### CVE-2026-88771: fixed builds
+
+[Citrix bulletin CTX697096](https://support.citrix.com/external/article/CTX697096/netscaler-adc-and-netscaler-gateway-secu.html) reports that CVE-2026-88771 permits unauthenticated remote code execution and that exploitation of unmitigated deployments has been observed. All affected customer-managed NetScaler ADC and NetScaler Gateway deployments are exposed, including default configurations; no additional feature needs to be enabled.
+
+| Product and edition | First fixed build |
+|---|---|
+| NetScaler ADC and NetScaler Gateway 14.1 | 14.1-73.37 |
+| NetScaler ADC and NetScaler Gateway 13.1 | 13.1-64.23 |
+| NetScaler ADC 14.1-FIPS | 14.1-73.37 FIPS |
+| NetScaler ADC 13.1-FIPS and 13.1-NDcPP | 13.1-37.279 |
+
+If the scanner cannot identify the firmware build or distinguish a FIPS/NDcPP edition, verify both on the appliance with `show ns version` before deciding whether it is patched. Compare the result with the corresponding edition and branch in Citrix's bulletin.
+For a known FIPS/NDcPP edition, older database entries without an edition-specific fix are listed as unassessed. The scanner does not substitute standard-release patch thresholds for those entries.
+
 ### CVE Applicability Logic
 
-Each CVE has defined configuration prerequisites. For example, CVE-2026-3055 requires SAML IDP configuration and CVE-2026-4368 requires Gateway or AAA vServer configuration. CitrixScan detects these configurations externally and reports whether the vulnerability is confirmed applicable or unconfirmed (requires CLI verification):
+Some CVEs have configuration prerequisites. For example, CVE-2026-3055 requires SAML IDP configuration and CVE-2026-4368 requires Gateway or AAA vServer configuration. CVE-2026-88771 applies to affected builds in the default configuration. CitrixScan reports whether detectable prerequisites are confirmed or unconfirmed (requires CLI verification):
 
 ```
 CVE-2026-3055  CVSS  9.3 CRITICAL  [SAML IDP] ✓ config confirmed
@@ -185,7 +201,7 @@ Many NetScaler appliances return the login portal HTML with `200 OK` for any una
 | Rating | Criteria |
 |---|---|
 | **CRITICAL** | IoC detected, EOL software, in-the-wild exploited CVE, or critical misconfiguration |
-| **HIGH** | Critical-severity CVE (no ITW), or unknown version with vulnerable config detected |
+| **HIGH** | Critical-severity CVE (no ITW), unassessed CVEs for a known FIPS/NDcPP edition, or unknown version with vulnerable config detected |
 | **MEDIUM** | High-severity CVEs, or NetScaler with unknown version |
 | **LOW** | Fully patched, no findings |
 | **INFO** | Not a NetScaler or not reachable |
@@ -197,7 +213,7 @@ Many NetScaler appliances return the login portal HTML with `200 OK` for any una
 | Format | Flag | Best For |
 |---|---|---|
 | **JSON** | `-o report.json` | SIEM ingestion, programmatic processing |
-| **CSV** | `--csv report.csv` | Spreadsheets, ticketing systems |
+| **CSV** | `--csv report.csv` | Spreadsheets, ticketing systems; includes detected CVE IDs |
 | **Markdown** | `--markdown report.md` | Executive reporting, wiki, Slack/Teams |
 | **Terminal** | (default) | Interactive use. Add `-v` for verbose. |
 
@@ -255,7 +271,7 @@ Phase 3: Deep Analysis
   └── Login page hash fingerprinting
 
 Phase 4: Security Assessment
-  ├── CVE mapping (25-entry database)
+  ├── CVE mapping (26-entry database)
   ├── IoC detection (15 paths, content analysis)
   ├── Misconfiguration checks (12 paths, login-page filtering)
   ├── TLS audit

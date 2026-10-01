@@ -90,12 +90,35 @@ class CVEEntry:
     public_poc: bool
     cwe: str
     references: List[str]
+    assume_eol_affected: bool = True
 
 
 # Comprehensive CVE database for NetScaler ADC and Gateway (2019-2026)
 # Each entry maps version ranges to vulnerability status
 CVE_DATABASE: List[CVEEntry] = [
     # ── 2026 ──
+    CVEEntry(
+        cve_id="CVE-2026-88771",
+        cvss=9.5, severity="CRITICAL",
+        title="Unauthenticated Remote Code Execution",
+        description="Improper input validation permits unauthenticated command execution on NetScaler ADC and Gateway in the default configuration.",
+        advisory="CTX697096",
+        affected_config=[],
+        affected_versions={
+            "14.1": "< 14.1-73.37", "13.1": "< 13.1-64.23",
+            "14.1-FIPS": "< 14.1-73.37", "13.1-FIPS": "< 13.1-37.279",
+            "13.1-NDcPP": "< 13.1-37.279",
+        },
+        fixed_versions={
+            "14.1": (14, 1, 73, 37), "13.1": (13, 1, 64, 23),
+            "14.1-FIPS": (14, 1, 73, 37), "13.1-FIPS": (13, 1, 37, 279),
+            "13.1-NDcPP": (13, 1, 37, 279),
+        },
+        exploited_in_wild=True, public_poc=False,
+        cwe="CWE-20",
+        references=["https://support.citrix.com/external/article/CTX697096/netscaler-adc-and-netscaler-gateway-secu.html"],
+        assume_eol_affected=False,
+    ),
     CVEEntry(
         cve_id="CVE-2026-3055",
         cvss=9.3, severity="CRITICAL",
@@ -452,16 +475,33 @@ def format_version(ver: tuple) -> str:
     return f"{ver[0]}.{ver[1]}-{ver[2]}.{ver[3]}"
 
 
-def check_cve_applicability(ver: tuple, config_flags: dict, cve: CVEEntry) -> dict:
-    """Check if a specific CVE applies to a version + configuration."""
+def version_branch(ver: tuple, version_raw: str = "") -> str:
+    """Keep an explicitly identified FIPS or NDcPP edition with its build."""
     branch = f"{ver[0]}.{ver[1]}"
+    if re.search(r"\bNDcPP\b", version_raw, re.IGNORECASE):
+        return f"{branch}-NDcPP"
+    if re.search(r"\bFIPS\b", version_raw, re.IGNORECASE):
+        return f"{branch}-FIPS"
+    return branch
+
+
+def check_cve_applicability(ver: tuple, config_flags: dict, cve: CVEEntry,
+                            version_raw: str = "") -> dict:
+    """Check if a specific CVE applies to a version + configuration."""
+    base_branch = f"{ver[0]}.{ver[1]}"
+    branch = version_branch(ver, version_raw)
     result = {
         "cve_id": cve.cve_id,
         "vulnerable": False,
         "config_applicable": True,
         "branch_match": False,
         "fixed_version": None,
+        "edition_unconfirmed": False,
     }
+    if branch != base_branch and branch not in cve.fixed_versions:
+        # A standard-release fix is not evidence of the FIPS/NDcPP fix build.
+        result["edition_unconfirmed"] = base_branch in cve.fixed_versions
+        return result
 
     # Check branch match
     if branch in cve.fixed_versions:
@@ -470,7 +510,15 @@ def check_cve_applicability(ver: tuple, config_flags: dict, cve: CVEEntry) -> di
         result["fixed_version"] = format_version(fixed)
         if ver < fixed:
             result["vulnerable"] = True
-    elif branch in EOL_BRANCHES:
+        if branch == base_branch:
+            alternate_fixes = (
+                alt_fix for alt_branch, alt_fix in cve.fixed_versions.items()
+                if alt_branch.startswith(f"{base_branch}-")
+            )
+            result["edition_unconfirmed"] = any(
+                (ver < fixed) != (ver < alt_fix) for alt_fix in alternate_fixes
+            )
+    elif branch in EOL_BRANCHES and cve.assume_eol_affected:
         # EOL branches — check if any fixed version exists for older branches
         for fb in cve.fixed_versions:
             fb_parts = fb.replace("-FIPS", "").split(".")
@@ -691,6 +739,8 @@ MISCONFIG_PATHS = [
 ]
 
 FIRMWARE_PATTERNS = [
+    r'(?:NetScaler|Citrix\s+ADC)\s+(?:FIPS|NDcPP)\s+NS(\d+\.\d+):\s*Build\s+(\d+\.\d+)',
+    r'(?:NetScaler|Citrix\s+ADC)\s+(?:(?:FIPS|NDcPP)\s+)?Release(?:\s+\([^)]+\))?\s+(\d+\.\d+)\s+Build\s+(\d+\.\d+)',
     r'NS(\d+\.\d+):\s*Build\s+(\d+\.\d+)',
     r'NetScaler\s+NS(\d+\.\d+):\s*Build\s+(\d+\.\d+)',
     r'(?:NetScaler|Citrix\s+ADC|Citrix\s+Gateway)\s+NS(\d+\.\d+):\s+Build\s+(\d+\.\d+)',
@@ -699,8 +749,21 @@ FIRMWARE_PATTERNS = [
 
 HEADER_PATTERNS = [
     r'NS(\d+\.\d+)\s*:\s*Build\s+(\d+\.\d+)',
+    r'(?:NetScaler|Citrix\s+ADC)\s+(?:(?:FIPS|NDcPP)\s+)?Release(?:\s+\([^)]+\))?\s+\d+\.\d+\s+Build\s+\d+\.\d+',
     r'Citrix[-_]?(?:ADC|Gateway)[-_/](\d+\.\d+[-_]\d+\.\d+)',
 ]
+
+
+def matched_firmware_version(match: re.Match, source: str) -> str:
+    """Retain an edition marker in the matched name or after its build."""
+    version = f"NS{match.group(1)}: Build {match.group(2)}"
+    marker = re.search(r"\b(FIPS|NDcPP)\b", match.group(0), re.IGNORECASE)
+    if not marker:
+        marker = re.match(r"(?:\.nc)?[\s._-]*(FIPS|NDcPP)\b",
+                          source[match.end():match.end() + 16], re.IGNORECASE)
+    if marker:
+        version += " NDcPP" if marker.group(1).lower() == "ndcpp" else " FIPS"
+    return version
 
 
 def extract_pe_version(data: bytes) -> Optional[str]:
@@ -795,7 +858,7 @@ def extract_nitro_version(resp):
             if val:
                 m = re.search(r'NS(\d+\.\d+):\s*Build\s+(\d+\.\d+)', val)
                 if m:
-                    return f"NS{m.group(1)}: Build {m.group(2)}"
+                    return matched_firmware_version(m, val)
         return None
 
     # Method 1: JSON parse
@@ -827,13 +890,13 @@ def extract_nitro_version(resp):
     for pat in FIRMWARE_PATTERNS:
         m = re.search(pat, body, re.IGNORECASE)
         if m:
-            return f"NS{m.group(1)}: Build {m.group(2)}"
+            return matched_firmware_version(m, body)
 
     # Method 3: Broader pattern - catches "14.1, Build 65.11" and similar variants
     m = re.search(r'(?:version|build|firmware)[^:]*?(\d{2}\.\d)[^:]*?build\s*(\d+\.\d+)',
                   body, re.IGNORECASE)
     if m:
-        candidate = f"NS{m.group(1)}: Build {m.group(2)}"
+        candidate = matched_firmware_version(m, body)
         if parse_netscaler_version(candidate):
             return candidate
 
@@ -843,7 +906,7 @@ def extract_nitro_version(resp):
         if val:
             m = re.search(r'NS(\d+\.\d+):\s*Build\s+(\d+\.\d+)', val)
             if m:
-                return f"NS{m.group(1)}: Build {m.group(2)}"
+                return matched_firmware_version(m, val)
 
     return None
 
@@ -889,6 +952,7 @@ class ScanResult:
     server_header: str = ""
     # CVE results
     cve_results: list = field(default_factory=list)
+    unassessed_cves: list = field(default_factory=list)
     critical_cves: int = 0
     high_cves: int = 0
     total_vulns: int = 0
@@ -1145,9 +1209,10 @@ def extract_version(responses, extended_responses, paths_tried, ctx, host, port,
                     return (version, f"GZIP timestamp {gzip_path} (stamp={stamp}, {dt_str})", "HIGH", "")
                 else:
                     dt_str = datetime.fromtimestamp(stamp, timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-                    return (f"unknown (stamp={stamp}, {dt_str})",
-                            f"GZIP timestamp {gzip_path} (not in lookup table)", "MEDIUM",
-                            f"rdx_en stamp={stamp} dt={dt_str} — not in {len(RDX_EN_STAMP_TO_VERSION)}-entry lookup table")
+                    all_diags.append(
+                        f"{gzip_path} — rdx_en stamp={stamp} dt={dt_str} "
+                        f"not in {len(RDX_EN_STAMP_TO_VERSION)}-entry lookup table"
+                    )
             elif stamp == 0:
                 all_diags.append(f"{gzip_path} — GZIP valid but MTIME=0 (timestamp stripped, likely gzip -n / reproducible build)")
                 # Don't break — try other paths which may have a real timestamp
@@ -1201,7 +1266,7 @@ def extract_version(responses, extended_responses, paths_tried, ctx, host, port,
         for pat in FIRMWARE_PATTERNS:
             m = re.search(pat, body, re.IGNORECASE)
             if m:
-                ver_str = f"NS{m.group(1)}: Build {m.group(2)}"
+                ver_str = matched_firmware_version(m, body)
                 if parse_netscaler_version(ver_str):
                     return (ver_str, f"Response body ({resp.get('url','')})", "MEDIUM", diagnostic)
 
@@ -1542,6 +1607,8 @@ def calculate_risk(result: ScanResult) -> str:
         return "CRITICAL"
     if result.high_cves > 0:
         return "HIGH"
+    if result.unassessed_cves:
+        return "HIGH"
     if result.is_netscaler and not result.version_raw:
         if result.saml_idp_detected or result.gateway_detected:
             return "HIGH"
@@ -1563,7 +1630,7 @@ def build_recommendations(result: ScanResult) -> list:
         recs.append("  → Preserve forensic evidence (snapshot, memory dump, logs).")
         recs.append("  → Engage DFIR team. Do NOT simply patch — full investigation required.")
     if result.eol:
-        recs.append(f"URGENT: Branch {result.branch} is End-of-Life. Upgrade to 14.1-66.59+ immediately.")
+        recs.append(f"URGENT: Branch {result.branch} is End-of-Life. Upgrade to 14.1-73.37+ immediately.")
     if result.exploited_itw_vulns > 0:
         itw_cves = [c["cve_id"] for c in result.cve_results if c.get("vulnerable") and c.get("exploited_itw")]
         recs.append(f"CRITICAL: {len(itw_cves)} CVE(s) with known in-the-wild exploitation: {', '.join(itw_cves)}")
@@ -1581,6 +1648,10 @@ def build_recommendations(result: ScanResult) -> list:
                         max_fix = fv
             if max_fix:
                 recs.append(f"  → Minimum target version: {format_version(max_fix)}")
+    if any(c.get("edition_unconfirmed") for c in result.cve_results):
+        recs.append("EDITION UNKNOWN: Confirm FIPS/NDcPP status with 'show ns version' before interpreting the fixed build.")
+    if result.unassessed_cves:
+        recs.append(f"EDITION COVERAGE: {len(result.unassessed_cves)} CVE(s) unassessed for {result.branch}; verify their edition-specific status on the appliance.")
     if any(f.get("severity") == "CRITICAL" for f in result.misconfig_findings):
         recs.append("MISCONFIG: Critical security misconfiguration(s) detected.")
         for f in result.misconfig_findings:
@@ -1595,6 +1666,7 @@ def build_recommendations(result: ScanResult) -> list:
         recs.append("FORENSICS: Snapshot appliance BEFORE patching for investigation.")
     if result.is_netscaler and not result.version_raw:
         recs.append("VERSION UNKNOWN: Authenticate and run 'show ns version' to confirm patch status.")
+        recs.append("  → CVE-2026-88771 patch status is unknown. Verify the build and edition against CTX697096 immediately.")
         if result.rdx_en_status:
             recs.append(f"  → Fingerprint diagnostic: {result.rdx_en_status}")
         if result.saml_idp_detected or result.gateway_detected:
@@ -1728,14 +1800,21 @@ def scan_target(target: str, port: int = 443, timeout: int = 15,
         result.version_parsed = parse_netscaler_version(ver_raw)
     if result.version_parsed:
         result.version_display = format_version(result.version_parsed)
-        result.branch = f"{result.version_parsed[0]}.{result.version_parsed[1]}"
-        result.eol = result.branch in EOL_BRANCHES
+        result.branch = version_branch(result.version_parsed, result.version_raw)
+        if result.branch.endswith("-FIPS"):
+            result.version_display += " FIPS"
+        elif result.branch.endswith("-NDcPP"):
+            result.version_display += " NDcPP"
+        result.eol = f"{result.version_parsed[0]}.{result.version_parsed[1]}" in EOL_BRANCHES
 
     # ── CVE Assessment ──
     if "cve" in modules or modules == "all":
         if result.version_parsed:
             for cve in CVE_DATABASE:
-                res = check_cve_applicability(result.version_parsed, config, cve)
+                res = check_cve_applicability(result.version_parsed, config, cve,
+                                              version_raw=result.version_raw)
+                if res["edition_unconfirmed"] and not res["branch_match"]:
+                    result.unassessed_cves.append(cve.cve_id)
                 res["cvss"] = cve.cvss
                 res["severity"] = cve.severity
                 res["title"] = cve.title
@@ -1840,12 +1919,19 @@ def print_result(r: ScanResult, verbose: bool = False):
                 conf_met = " ✓ config confirmed"
             elif cv.get("config_applicable") is False:
                 conf_met = " ? config unconfirmed"
+            if cv.get("edition_unconfirmed"):
+                conf_met += " ? edition unconfirmed"
             print(f"    {sc}{cv['cve_id']:18s} CVSS {cv['cvss']:4.1f} {cv['severity']:8s}{R} "
                   f"{cv['title'][:45]}{cfg}{itw}{poc}{conf_met}")
             if cv.get("fixed_version"):
                 print(f"      → Fix: {cv['fixed_version']}  ({cv.get('advisory','')})")
     elif r.version_parsed:
-        print(f"\n  {B}Vulnerabilities:{R} \033[92mNone found for {r.version_display}{R}")
+        if r.unassessed_cves:
+            print(f"\n  {B}Vulnerabilities:{R} None confirmed; {len(r.unassessed_cves)} CVE(s) unassessed for {r.branch}")
+        else:
+            print(f"\n  {B}Vulnerabilities:{R} \033[92mNone found for {r.version_display}{R}")
+    if r.unassessed_cves:
+        print(f"  Unassessed CVEs: {', '.join(r.unassessed_cves)}")
 
     # IoCs
     if r.ioc_findings:
@@ -1902,6 +1988,8 @@ def print_summary(results: list):
     ioc = sum(len(r.ioc_findings) for r in results)
     total_cves = sum(r.total_vulns for r in results)
     itw = sum(r.exploited_itw_vulns for r in results)
+    unassessed = sum(len(r.unassessed_cves) for r in results)
+    unassessed_targets = sum(1 for r in results if r.unassessed_cves)
     eol_count = sum(1 for r in results if r.eol)
 
     print(f"\n{'═'*80}")
@@ -1916,6 +2004,8 @@ def print_summary(results: list):
     print(f"  {COLORS['HIGH']}HIGH{R}      : {high}")
     print(f"  {COLORS['MEDIUM']}MEDIUM{R}    : {med}")
     print(f"\n  Total CVEs Found   : {total_cves}")
+    print(f"  Unassessed CVEs    : {unassessed}")
+    print(f"  Targets with Unassessed CVEs : {unassessed_targets}")
     print(f"  Exploited-ITW CVEs : {itw}")
     print(f"  IoC Detections     : {ioc}")
 
@@ -1947,6 +2037,8 @@ def export_json(results: list, filepath: str):
                 "critical": sum(1 for r in results if r.risk_rating == "CRITICAL"),
                 "high": sum(1 for r in results if r.risk_rating == "HIGH"),
                 "total_cves": sum(r.total_vulns for r in results),
+                "unassessed_cves": sum(len(r.unassessed_cves) for r in results),
+                "targets_with_unassessed_cves": sum(1 for r in results if r.unassessed_cves),
                 "iocs": sum(len(r.ioc_findings) for r in results),
             },
         }, f, indent=2, default=str)
@@ -1959,7 +2051,7 @@ def export_csv(results: list, filepath: str):
         "branch", "eol", "version_source", "version_confidence",
         "saml_idp_detected", "oauth_idp_detected", "gateway_detected", "aaa_detected", "mgmt_exposed",
         "tls_protocol", "tls_cipher", "tls_bits",
-        "total_vulns", "critical_cves", "high_cves", "exploited_itw_vulns",
+        "total_vulns", "critical_cves", "high_cves", "exploited_itw_vulns", "cve_ids", "unassessed_cve_ids",
         "ioc_count", "misconfig_count", "risk_rating", "recommendations",
     ]
     with open(filepath, "w", newline="", encoding="utf-8") as f:
@@ -1969,6 +2061,10 @@ def export_csv(results: list, filepath: str):
             row = {k: getattr(r, k, "") for k in fields}
             row["ioc_count"] = len(r.ioc_findings)
             row["misconfig_count"] = len(r.misconfig_findings)
+            row["cve_ids"] = ", ".join(
+                c["cve_id"] for c in r.cve_results if c.get("vulnerable")
+            )
+            row["unassessed_cve_ids"] = ", ".join(r.unassessed_cves)
             row["recommendations"] = " | ".join(r.recommendations)
             w.writerow(row)
     print(f"[+] CSV: {filepath}")
@@ -1989,6 +2085,8 @@ def export_markdown(results: list, filepath: str):
         f.write(f"| CRITICAL | {sum(1 for r in results if r.risk_rating == 'CRITICAL')} |\n")
         f.write(f"| HIGH | {sum(1 for r in results if r.risk_rating == 'HIGH')} |\n")
         f.write(f"| Total CVEs | {sum(r.total_vulns for r in results)} |\n")
+        f.write(f"| Unassessed CVEs | {sum(len(r.unassessed_cves) for r in results)} |\n")
+        f.write(f"| Targets with Unassessed CVEs | {sum(1 for r in results if r.unassessed_cves)} |\n")
         f.write(f"| IoC Detections | {sum(len(r.ioc_findings) for r in results)} |\n\n")
 
         # Per-target details
@@ -2003,6 +2101,8 @@ def export_markdown(results: list, filepath: str):
             f.write(f"- **OAuth IdP:** {'Yes' if r.oauth_idp_detected else 'No'}\n")
             f.write(f"- **Gateway:** {'Yes' if r.gateway_detected else 'No'}\n")
             f.write(f"- **CVEs:** {r.total_vulns} ({r.critical_cves} critical, {r.exploited_itw_vulns} exploited-ITW)\n\n")
+            if r.unassessed_cves:
+                f.write(f"- **Unassessed CVEs for this edition:** {', '.join(r.unassessed_cves)}\n\n")
 
             if r.cve_results:
                 f.write("| CVE | CVSS | Severity | Title | Fix |\n|---|---|---|---|---|\n")
