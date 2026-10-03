@@ -98,7 +98,7 @@ def test_unknown_gzip_stamp_falls_back_to_header_version(monkeypatch):
 
     assert raw == "NS14.1: Build 73.36"
     assert source == "HTTP header (X-NS-version)"
-    assert confidence == "HIGH"
+    assert confidence == "MEDIUM"
     assert "not in" in diagnostic
 
 
@@ -223,7 +223,8 @@ def test_scan_uses_identified_edition_for_cve_and_eol(
                     "body": "Citrix Gateway", "url": path}
         if path == "/nitro/v1/config/nsversion":
             return {"status": 200, "headers": {},
-                    "body": f'{{"version": "{version}"}}', "url": path}
+                    "body": f'{{"errorcode": 0, "nsversion": [{{"version": "{version}"}}]}}',
+                    "url": path}
         return None
 
     monkeypatch.setattr(citrixscan, "http_get", http_response)
@@ -259,7 +260,7 @@ def test_official_fips_release_in_header_identifies_version(monkeypatch):
         responses, [], {}, None, "example.invalid", 443, 1
     )
 
-    assert raw == "NetScaler FIPS Release 13.1 Build 37.279"
+    assert raw == "NS13.1: Build 37.279 FIPS"
     assert source == "HTTP header (Server)"
 
 

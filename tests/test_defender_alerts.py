@@ -337,7 +337,7 @@ def test_tcp_open_without_https_response_is_incomplete(monkeypatch, capsys):
     monkeypatch.setattr(citrixscan.socket, "gethostbyname", lambda _target: "192.0.2.1")
     monkeypatch.setattr(citrixscan.socket, "create_connection",
                         lambda *_args, **_kwargs: nullcontext())
-    monkeypatch.setattr(citrixscan, "get_tls_info", lambda *_args: {
+    monkeypatch.setattr(citrixscan, "get_tls_info", lambda *_args, **_kwargs: {
         "protocol": "", "cipher": "", "bits": 0, "cn": "", "san": "",
         "issuer": "", "not_after": "",
     })

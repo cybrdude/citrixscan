@@ -55,6 +55,7 @@ import socket
 import struct
 import sys
 import os
+import tempfile
 import urllib.request
 import urllib.error
 from urllib.parse import urljoin, urlsplit
@@ -587,11 +588,27 @@ def create_ssl_context() -> ssl.SSLContext:
     return ctx
 
 
-def get_tls_info(host: str, port: int, ctx: ssl.SSLContext) -> dict:
+def decode_der_certificate(der: bytes) -> dict:
+    """Best-effort certificate metadata under CERT_NONE, using CPython SSL."""
+    decoder = getattr(getattr(ssl, "_ssl", None), "_test_decode_cert", None)
+    if not der or decoder is None:
+        return {}
+    try:
+        pem = ssl.DER_cert_to_PEM_cert(der)
+        with tempfile.TemporaryDirectory(prefix="citrixscan-cert-") as directory:
+            path = os.path.join(directory, "peer.pem")
+            with open(path, "w", encoding="ascii") as cert_file:
+                cert_file.write(pem)
+            return decoder(path)
+    except (OSError, ValueError, ssl.SSLError):
+        return {}
+
+
+def get_tls_info(host: str, port: int, ctx: ssl.SSLContext, timeout: int = 10) -> dict:
     info = {"cn": "", "san": "", "issuer": "", "not_after": "", "not_before": "",
             "serial": "", "version": 0, "protocol": "", "cipher": "", "bits": 0}
     try:
-        with socket.create_connection((host, port), timeout=10) as sock:
+        with socket.create_connection((host, port), timeout=timeout) as sock:
             with ctx.wrap_socket(sock, server_hostname=host) as ssock:
                 info["protocol"] = ssock.version() or ""
                 cipher_info = ssock.cipher()
@@ -599,6 +616,8 @@ def get_tls_info(host: str, port: int, ctx: ssl.SSLContext) -> dict:
                     info["cipher"] = cipher_info[0]
                     info["bits"] = cipher_info[2] if len(cipher_info) > 2 else 0
                 cert = ssock.getpeercert(binary_form=False)
+                if not cert:
+                    cert = decode_der_certificate(ssock.getpeercert(binary_form=True))
                 if cert:
                     for rdn in cert.get("subject", ()):
                         for attr, val in rdn:
@@ -658,27 +677,60 @@ def audit_tls(tls_info: dict) -> List[dict]:
 
 
 class TargetRedirectHandler(urllib.request.HTTPRedirectHandler):
-    """Allow redirects only to the same HTTPS host and port."""
+    """Allow redirects only to the same scheme, host, and port."""
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         old = urlsplit(req.full_url)
         new = urlsplit(urljoin(req.full_url, newurl))
-        if (new.scheme != "https" or (new.hostname or "").lower() !=
-                (old.hostname or "").lower() or (new.port or 443) != (old.port or 443)):
+        default_port = 443 if old.scheme == "https" else 80
+        if (new.scheme != old.scheme or (new.hostname or "").lower() !=
+                (old.hostname or "").lower() or (new.port or default_port) !=
+                (old.port or default_port)):
             return None
-        return super().redirect_request(req, fp, code, msg, headers, newurl)
+        return super().redirect_request(req, fp, code, msg, headers, new.geturl())
 
 
-def http_get(host, port, path, ctx, timeout=15, method="GET", max_body=8192):
-    url = f"https://{host}:{port}{path}"
+def header_value(headers, name):
+    """Read HTTP response headers without depending on server capitalization."""
+    return next((value for key, value in (headers or {}).items()
+                 if key.lower() == name.lower()), "")
+
+
+def classified_server_header(value):
+    """Retain the server family without exporting an untrusted header value."""
+    lower = value.lower()
+    for marker, label in (("netscaler", "NetScaler"), ("citrix", "Citrix"),
+                          ("apache", "Apache"), ("nginx", "nginx"),
+                          ("microsoft-iis", "Microsoft-IIS")):
+        if marker in lower:
+            return label
+    return "present" if value else ""
+
+
+def response_evidence(resp):
+    """Report a response without copying potentially sensitive body content."""
+    body = resp.get("body", "")
+    encoded = body.encode("utf-8", errors="replace")
+    return {"http_status": resp["status"], "content_size": len(encoded),
+            "content_sha256": hashlib.sha256(encoded).hexdigest()}
+
+
+def http_get(host, port, path, ctx, timeout=15, method="GET", max_body=8192,
+             scheme="https"):
+    if scheme not in ("http", "https"):
+        raise ValueError("scheme must be http or https")
+    url_host = f"[{host}]" if ":" in host else host
+    url = f"{scheme}://{url_host}:{port}{path}"
     req = urllib.request.Request(url, method=method, headers={
         "User-Agent": "CitrixScan/1.0 (Security Assessment)",
         "Accept": "text/html,application/json,application/xml;q=0.9,*/*;q=0.8",
         "Connection": "close",
     })
     try:
-        handler = urllib.request.HTTPSHandler(context=ctx)
-        opener = urllib.request.build_opener(handler, TargetRedirectHandler())
+        handlers = [urllib.request.ProxyHandler({})]
+        if scheme == "https":
+            handlers.append(urllib.request.HTTPSHandler(context=ctx))
+        opener = urllib.request.build_opener(*handlers, TargetRedirectHandler())
         resp = opener.open(req, timeout=timeout)
         headers = dict(resp.headers)
         body = resp.read(max_body).decode("utf-8", errors="replace") if method == "GET" else ""
@@ -697,15 +749,21 @@ def http_get(host, port, path, ctx, timeout=15, method="GET", max_body=8192):
         return None
 
 
-def http_get_binary(host, port, path, ctx, timeout=30, max_bytes=20*1024*1024):
-    url = f"https://{host}:{port}{path}"
+def http_get_binary(host, port, path, ctx, timeout=30, max_bytes=20*1024*1024,
+                    scheme="https"):
+    if scheme not in ("http", "https"):
+        raise ValueError("scheme must be http or https")
+    url_host = f"[{host}]" if ":" in host else host
+    url = f"{scheme}://{url_host}:{port}{path}"
     req = urllib.request.Request(url, headers={
         "User-Agent": "CitrixScan/1.0 (Security Assessment)",
         "Accept": "application/octet-stream,*/*", "Connection": "close",
     })
     try:
-        handler = urllib.request.HTTPSHandler(context=ctx)
-        opener = urllib.request.build_opener(handler, TargetRedirectHandler())
+        handlers = [urllib.request.ProxyHandler({})]
+        if scheme == "https":
+            handlers.append(urllib.request.HTTPSHandler(context=ctx))
+        opener = urllib.request.build_opener(*handlers, TargetRedirectHandler())
         resp = opener.open(req, timeout=timeout)
         data = resp.read(max_bytes)
         return {"status": resp.status, "headers": dict(resp.headers), "data": data, "size": len(data)}
@@ -869,76 +927,70 @@ def extract_pe_version(data: bytes) -> Optional[str]:
     return None
 
 
-def extract_nitro_version(resp):
-    """Extract firmware version from NITRO or /nsversion responses.
+def extract_nitro_version(resp, nitro_path=False):
+    """Return a build only from a NITRO version field or direct version text.
 
-    These endpoints can return:
-      - JSON: {"nsversion": [{"version": "NetScaler NS14.1: Build 65.11.nc ..."}]}
-      - JSON: {"version": "NS14.1: Build 65.11"}
-      - HTML page with version embedded
-      - Plain text with version string
-      - JSON with errorcode (auth required) but version leaked in headers/body
+    An arbitrary JSON string or a login page can contain a historical build;
+    neither identifies the running firmware of the requested endpoint.
     """
-    if not resp or resp["status"] not in (200, 401, 403):
+    if not resp or resp["status"] != 200:
         return None
     body = resp.get("body", "")
-    if not body:
-        return None
-
-    # IMPORTANT: If body is just a login page, don't scan it for version strings
-    # (login pages are returned for ALL unauthenticated paths on locked-down appliances)
-    if is_login_page(body):
-        # Still check headers — version can leak there even when body is login page
-        for hdr in ("X-NS-version", "Server", "Via", "X-Citrix-Version"):
-            val = resp.get("headers", {}).get(hdr, "")
-            if val:
-                m = re.search(r'NS(\d+\.\d+):\s*Build\s+(\d+\.\d+)', val)
-                if m:
-                    return matched_firmware_version(m, val)
-        return None
-
-    # Method 1: JSON parse
-    try:
-        data = json.loads(body)
-        # Walk all string values looking for NS version pattern
-        def _walk_json(obj):
-            if isinstance(obj, str):
-                if re.search(r'NS\d+\.\d+', obj):
-                    return obj
-            elif isinstance(obj, dict):
-                for v in obj.values():
-                    r = _walk_json(v)
-                    if r:
-                        return r
-            elif isinstance(obj, list):
-                for item in obj:
-                    r = _walk_json(item)
-                    if r:
-                        return r
+    if nitro_path:
+        final_url = resp.get("final_url")
+        if final_url:
+            final = urlsplit(final_url)
+            original = urlsplit(resp.get("url", ""))
+            if posixpath.normpath(final.path) != "/nitro/v1/config/nsversion":
+                return None
+            if original.netloc and (final.scheme != original.scheme or
+                                    final.netloc.lower() != original.netloc.lower()):
+                return None
+        if not body or is_login_page(body):
             return None
-        json_ver = _walk_json(data)
-        if json_ver:
-            return json_ver
-    except (json.JSONDecodeError, TypeError):
-        pass
+        try:
+            data = json.loads(body)
+        except (json.JSONDecodeError, TypeError):
+            return None
+        if (not isinstance(data, dict) or type(data.get("errorcode")) is not int
+                or data["errorcode"] != 0 or not isinstance(data.get("nsversion"), list)):
+            return None
+        for item in data["nsversion"]:
+            if isinstance(item, dict) and isinstance(item.get("version"), str):
+                if parse_netscaler_version(item["version"]):
+                    return item["version"]
+        return None
+    if body and not is_login_page(body):
+        try:
+            data = json.loads(body)
+        except (json.JSONDecodeError, TypeError):
+            data = None
+        if isinstance(data, dict):
+            candidates = []
+            version_field = data.get("version")
+            if isinstance(version_field, str):
+                candidates.append(version_field)
+            nsversion = data.get("nsversion")
+            if isinstance(nsversion, dict):
+                nsversion = [nsversion]
+            if isinstance(nsversion, list):
+                candidates.extend(item.get("version") for item in nsversion
+                                  if isinstance(item, dict))
+            for candidate in candidates:
+                if isinstance(candidate, str) and parse_netscaler_version(candidate):
+                    return candidate
+        elif data is None and not nitro_path and "<" not in body:
+            for pat in FIRMWARE_PATTERNS:
+                match = re.search(pat, body, re.IGNORECASE)
+                if match:
+                    candidate = matched_firmware_version(match, body)
+                    if parse_netscaler_version(candidate):
+                        return candidate
 
-    # Method 2: Regex scan raw body for firmware patterns (works on HTML, text, partial JSON)
-    for pat in FIRMWARE_PATTERNS:
-        m = re.search(pat, body, re.IGNORECASE)
-        if m:
-            return matched_firmware_version(m, body)
-
-    # Method 3: Broader pattern - catches "14.1, Build 65.11" and similar variants
-    m = re.search(r'(?:version|build|firmware)[^:]*?(\d{2}\.\d)[^:]*?build\s*(\d+\.\d+)',
-                  body, re.IGNORECASE)
-    if m:
-        candidate = matched_firmware_version(m, body)
-        if parse_netscaler_version(candidate):
-            return candidate
-
-    # Method 4: Check response headers for version leak
+    # Some appliances include a build in an explicit response header even
+    # when authentication prevents access to the body.
     for hdr in ("X-NS-version", "Server", "Via", "X-Citrix-Version"):
-        val = resp.get("headers", {}).get(hdr, "")
+        val = header_value(resp.get("headers", {}), hdr)
         if val:
             m = re.search(r'NS(\d+\.\d+):\s*Build\s+(\d+\.\d+)', val)
             if m:
@@ -958,6 +1010,7 @@ class ScanResult:
     port: int
     timestamp: str
     modules_run: str = "all"
+    http_scheme: str = "https"
     reachable: bool = False
     is_netscaler: bool = False
     version_raw: str = ""
@@ -965,6 +1018,11 @@ class ScanResult:
     version_display: str = ""
     version_source: str = ""
     version_confidence: str = ""
+    patch_status: str = "unverified_external"
+    version_evidence: list = field(default_factory=list)
+    asset_fingerprints: dict = field(default_factory=dict)
+    response_hashes: dict = field(default_factory=dict)
+    shared_response_hosts: int = 0
     rdx_en_status: str = ""  # Diagnostic: what rdx_en.json.gz returned
     branch: str = ""
     eol: bool = False
@@ -1035,6 +1093,31 @@ def detect_product(responses: list, tls_info: dict) -> bool:
     if any(kw in tls_combined for kw in ["netscaler", "citrix", "ns."]):
         signals += 1
     return signals >= 2
+
+
+def detect_live_product(responses: list, tls_info: dict) -> bool:
+    """Require a native response signal, not reflected probe-path text."""
+    for resp in responses:
+        if not resp:
+            continue
+        headers = resp.get("headers", {})
+        server = header_value(headers, "Server").lower()
+        if any(name in server for name in ("netscaler", "citrix adc", "citrix gateway")):
+            return True
+        cookies = header_value(headers, "Set-Cookie").lower()
+        if "nsc_" in cookies or "ns_vpn" in cookies:
+            return True
+        if any(header_value(headers, name) for name in ("X-NS-version", "X-NS-Build")):
+            return True
+        body = resp.get("body", "")
+        if re.search(r"<title[^>]*>\s*(?:citrix gateway|netscaler(?: gateway| adc)?)\b",
+                     body, re.IGNORECASE):
+            return True
+        if "<html" in body.lower() and "logonpoint" in body.lower() and (
+            "citrix" in body.lower() or "netscaler" in body.lower()
+        ):
+            return True
+    return False
 
 
 def review_saml_config(config_text: str) -> dict:
@@ -1227,18 +1310,38 @@ RDX_EN_STAMP_TO_VERSION = {
 
 
 def extract_version(responses, extended_responses, paths_tried, ctx, host, port, timeout,
-                    allow_epa_download=True) -> Tuple[str, str, str, str]:
-    """Multi-vector version extraction. Returns (raw, source, confidence, diagnostic).
+                    allow_epa_download=True, scheme="https", evidence_out=None,
+                    corpus=None
+                    ) -> Tuple[str, str, str, str]:
+    """Collect live build signals and suppress a verdict when builds conflict.
 
     Priority order:
       1. GZIP timestamp from rdx_en.json.gz (Fox-IT technique — highest accuracy)
       2. NITRO API / nsversion endpoints
       3. HTTP headers
       4. Body firmware patterns
-      5. EPA binary PE string scan
-      6. Content-Length / hash fingerprints
+      5. Stock resource fingerprints when a trusted map is supplied
     """
     diagnostic = ""
+    candidates = []
+    request_options = {"scheme": scheme} if scheme != "https" else {}
+
+    def record_version(raw, source, confidence):
+        parsed = parse_netscaler_version(raw)
+        if parsed:
+            branch = version_branch(parsed, raw)
+            normalized = f"NS{parsed[0]}.{parsed[1]}: Build {parsed[2]}.{parsed[3]}"
+            if branch.endswith("-FIPS"):
+                normalized += " FIPS"
+            elif branch.endswith("-NDcPP"):
+                normalized += " NDcPP"
+            candidates.append((normalized, source, confidence, parsed, branch))
+            if evidence_out is not None:
+                item = {"version": format_version(parsed), "edition_branch": branch,
+                        "source": source,
+                        "confidence": confidence}
+                if item not in evidence_out:
+                    evidence_out.append(item)
 
     # 1. GZIP timestamp from resource files (Fox-IT technique)
     # The GZIP MTIME field (bytes 4-8) contains the build compilation timestamp.
@@ -1249,12 +1352,11 @@ def extract_version(responses, extended_responses, paths_tried, ctx, host, port,
         "/vpn/js/rdx/core/lang-ext/rdx_en.json.gz",
         "/vpn/js/rdx/core/lang/rdx_en.json",  # Some builds serve uncompressed with GZIP encoding
     ]
-    rdx_stamp = None
-
     all_diags = []
 
     for gzip_path in gzip_paths:
-        rdx_resp = http_get_binary(host, port, gzip_path, ctx, timeout, max_bytes=4096)
+        rdx_resp = http_get_binary(host, port, gzip_path, ctx, timeout,
+                                   max_bytes=4096, **request_options)
         if not rdx_resp:
             all_diags.append(f"{gzip_path} — connection failed")
             continue
@@ -1267,21 +1369,31 @@ def extract_version(responses, extended_responses, paths_tried, ctx, host, port,
             all_diags.append(f"{gzip_path} — empty response")
             continue
 
-        # Check for GZIP magic bytes
-        if len(data) >= 20 and data[0:2] == b"\x1f\x8b":
+        # RFC 1952: magic, DEFLATE method, and no reserved FLG bits.
+        if (len(data) >= 10 and data[0:3] == b"\x1f\x8b\x08"
+                and data[3] & 0xE0 == 0):
             stamp = int.from_bytes(data[4:8], "little")
             if 1500000000 < stamp < 2000000000:
-                rdx_stamp = stamp
                 version = RDX_EN_STAMP_TO_VERSION.get(stamp)
                 if version and version != "unknown":
                     dt_str = datetime.fromtimestamp(stamp, timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-                    return (version, f"GZIP timestamp {gzip_path} (stamp={stamp}, {dt_str})", "HIGH", "")
+                    record_version(version,
+                                   f"GZIP timestamp {gzip_path} (stamp={stamp}, {dt_str})",
+                                   "MEDIUM")
                 else:
                     dt_str = datetime.fromtimestamp(stamp, timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
                     all_diags.append(
                         f"{gzip_path} — rdx_en stamp={stamp} dt={dt_str} "
                         f"not in {len(RDX_EN_STAMP_TO_VERSION)}-entry lookup table"
                     )
+                if corpus:
+                    corpus_matches = (corpus.get("fingerprints", {})
+                                      .get("rdx_en_gzip_mtime", {})
+                                      .get(str(stamp), []))
+                    for match in corpus_matches:
+                        if isinstance(match, dict) and isinstance(match.get("build"), str):
+                            record_version(match["build"],
+                                           f"Firmware corpus GZIP stamp {stamp}", "MEDIUM")
             elif stamp == 0:
                 all_diags.append(f"{gzip_path} — GZIP valid but MTIME=0 (timestamp stripped, likely gzip -n / reproducible build)")
                 # Don't break — try other paths which may have a real timestamp
@@ -1289,16 +1401,12 @@ def extract_version(responses, extended_responses, paths_tried, ctx, host, port,
                 all_diags.append(f"{gzip_path} — GZIP valid but MTIME out of range: {stamp}")
         else:
             # Not GZIP — check what we got
-            try:
-                text_preview = data[:80].decode("utf-8", errors="replace").replace("\n", " ")
-            except Exception:
-                text_preview = f"<binary {len(data)} bytes, magic={data[:4].hex()}>"
             if b"<html" in data.lower()[:200] or b"<!doctype" in data.lower()[:200]:
                 all_diags.append(f"{gzip_path} — login page redirect (HTML, not GZIP)")
             elif b"{" in data[:10]:
                 all_diags.append(f"{gzip_path} — JSON response (not GZIP compressed)")
             else:
-                all_diags.append(f"{gzip_path} — unexpected content: {text_preview[:60]}")
+                all_diags.append(f"{gzip_path} — unexpected content type (not GZIP)")
 
     diagnostic = " | ".join(all_diags) if all_diags else "rdx_en: no paths accessible"
 
@@ -1306,10 +1414,10 @@ def extract_version(responses, extended_responses, paths_tried, ctx, host, port,
     for ep in ["/nitro/v1/config/nsversion", "/nsversion"]:
         resp = paths_tried.get(ep)
         if resp:
-            nv = extract_nitro_version(resp)
+            nv = extract_nitro_version(resp, nitro_path=ep.startswith("/nitro/"))
             if nv and parse_netscaler_version(nv):
                 src = "NITRO API" if "nitro" in ep else "/nsversion endpoint"
-                return (nv, src, "HIGH", diagnostic)
+                record_version(nv, src, "HIGH" if ep.startswith("/nitro/") else "MEDIUM")
 
     # 2. HTTP headers across all responses
     all_resp = responses + (extended_responses or [])
@@ -1317,19 +1425,22 @@ def extract_version(responses, extended_responses, paths_tried, ctx, host, port,
         if not resp:
             continue
         for hdr in ("Server", "X-NS-version", "X-Citrix-Version", "Via", "X-NS-Build"):
-            val = resp["headers"].get(hdr, "")
+            val = header_value(resp.get("headers", {}), hdr)
             if val:
                 for pat in HEADER_PATTERNS:
                     m = re.search(pat, val, re.IGNORECASE)
                     if m and not is_plugin_version(val):
                         if parse_netscaler_version(val):
-                            return (val.strip(), f"HTTP header ({hdr})", "HIGH", diagnostic)
+                            actual_name = next((key for key in resp["headers"]
+                                                if key.lower() == hdr.lower()), hdr)
+                            record_version(val, f"HTTP header ({actual_name})", "MEDIUM")
 
     # 3. Body firmware patterns (skip pluginlist.xml)
     for resp in all_resp:
         if not resp:
             continue
-        if "pluginlist.xml" in resp.get("url", ""):
+        if any(path in resp.get("url", "") for path in
+               ("pluginlist.xml", "/nitro/", "/nsversion")):
             continue
         body = resp.get("body", "")
         for pat in FIRMWARE_PATTERNS:
@@ -1337,14 +1448,16 @@ def extract_version(responses, extended_responses, paths_tried, ctx, host, port,
             if m:
                 ver_str = matched_firmware_version(m, body)
                 if parse_netscaler_version(ver_str):
-                    return (ver_str, f"Response body ({resp.get('url','')})", "MEDIUM", diagnostic)
+                    source_path = urlsplit(resp.get("url", "")).path or "response"
+                    record_version(ver_str, f"Response body ({source_path})", "MEDIUM")
 
     # 4. EPA binary analysis (PE extraction + Content-Length fingerprint)
     epa_info = {}
     for epa_path in EPA_PATHS:
-        head = http_get(host, port, epa_path, ctx, timeout, method="HEAD")
+        head = http_get(host, port, epa_path, ctx, timeout,
+                        method="HEAD", **request_options)
         if head and head["status"] == 200:
-            cl = head["headers"].get("Content-Length", "0")
+            cl = header_value(head.get("headers", {}), "Content-Length") or "0"
             try:
                 size = int(cl)
             except ValueError:
@@ -1353,26 +1466,16 @@ def extract_version(responses, extended_responses, paths_tried, ctx, host, port,
             epa_info["size"] = size
             epa_info["path"] = epa_path
 
-            # 4a. Content-Length fingerprint (known EPA sizes → firmware builds)
-            # EPA binary sizes are unique per NetScaler release. This mapping can
-            # be populated from your fleet baselines. Format: size_bytes → "NS version string"
-            # Example: EPA_SIZE_MAP = {14432360: "NS14.1: Build 65.11", ...}
-            EPA_SIZE_MAP = {
-                # Add known mappings from your fleet here:
-                # 14432360: "NS14.1: Build 65.11",
-            }
-            if size in EPA_SIZE_MAP:
-                ver_str = EPA_SIZE_MAP[size]
-                if parse_netscaler_version(ver_str):
-                    return (ver_str, f"EPA Content-Length fingerprint ({size} bytes)", "MEDIUM", diagnostic)
-
-            # 4b. PE binary deep scan — download and search for firmware strings
+            # EPA is a client plugin. Its length and PE FileVersion are useful
+            # inventory clues, but do not establish the appliance's running build.
+            all_diags.append(f"{epa_path} — EPA client available (size={size})")
             if allow_epa_download and 0 < size <= 20 * 1024 * 1024:
-                bin_resp = http_get_binary(host, port, epa_path, ctx, timeout)
+                bin_resp = http_get_binary(host, port, epa_path, ctx, timeout,
+                                           **request_options)
                 if bin_resp and bin_resp["status"] == 200 and bin_resp["data"]:
                     epa_ver = extract_pe_version(bin_resp["data"])
-                    if epa_ver and parse_netscaler_version(epa_ver):
-                        return (epa_ver, f"EPA binary PE ({epa_path}, {len(bin_resp['data'])} bytes)", "HIGH", diagnostic)
+                    if epa_ver:
+                        all_diags.append(f"{epa_path} — EPA client PE version observed")
             break  # Only try first available EPA path
 
     # 5. Login page / static resource hash fingerprint
@@ -1395,8 +1498,33 @@ def extract_version(responses, extended_responses, paths_tried, ctx, host, port,
             if h in KNOWN_PAGE_HASHES:
                 ver_str = KNOWN_PAGE_HASHES[h]
                 if parse_netscaler_version(ver_str):
-                    return (ver_str, f"Page hash fingerprint ({hp}: {h})", "MEDIUM", diagnostic)
+                    record_version(ver_str, f"Page hash fingerprint ({hp}: {h})", "MEDIUM")
 
+    # Fox-IT's stock ?v= cache token can be extracted from the login page.
+    # Its build mapping must come from a local firmware corpus, not guesswork.
+    index_resp = paths_tried.get("/vpn/index.html")
+    if corpus and index_resp and index_resp.get("status") == 200:
+        tokens = set(re.findall(r"\?v=([0-9a-f]{32})(?![0-9a-z_])",
+                                index_resp.get("body", ""), re.IGNORECASE))
+        token_map = corpus.get("fingerprints", {}).get("vpn_index_v", {})
+        for token in tokens:
+            for match in token_map.get(token.lower(), []):
+                if isinstance(match, dict) and isinstance(match.get("build"), str):
+                    record_version(match["build"],
+                                   f"Firmware corpus VPN asset token {token.lower()}",
+                                   "MEDIUM")
+
+    diagnostic = " | ".join(all_diags) if all_diags else diagnostic
+    unique_builds = {(item[3], item[4]) for item in candidates}
+    if len(unique_builds) > 1:
+        versions = ", ".join(sorted(
+            f"{format_version(build)} ({branch})" for build, branch in unique_builds
+        ))
+        return ("", "", "", f"Live build conflict: {versions}. {diagnostic}".strip())
+    if candidates:
+        selected = next((item for item in candidates if item[2] == "HIGH"),
+                        candidates[0])
+        return (selected[0], selected[1], selected[2], diagnostic)
     return ("", "", "", diagnostic)
 
 
@@ -1416,10 +1544,10 @@ def check_security_headers(responses: list) -> list:
                 if hdr not in resp["headers"]:
                     findings.append({"check": hdr, "severity": sev, "detail": msg})
             # Check for server version disclosure
-            srv = resp["headers"].get("Server", "")
+            srv = header_value(resp["headers"], "Server")
             if srv and any(kw in srv.lower() for kw in ["apache", "nginx", "netscaler", "ns-"]):
                 findings.append({"check": "Server Header Disclosure", "severity": "LOW",
-                                 "detail": f"Server header reveals software: {srv}"})
+                                 "detail": f"Server header reveals software: {classified_server_header(srv)}"})
             break
     return findings
 
@@ -1450,7 +1578,7 @@ STOCK_CONTENT_SIGNATURES = [
 ]
 
 
-def check_iocs(host, port, ctx, timeout) -> list:
+def check_iocs(host, port, ctx, timeout, scheme="https") -> list:
     """Probe for known IoC paths with content-based analysis.
 
     Distinguishes:
@@ -1461,7 +1589,9 @@ def check_iocs(host, port, ctx, timeout) -> list:
     """
     findings = []
     for path in IOC_PATHS:
-        resp = http_get(host, port, path, ctx, timeout, max_body=65536)
+        request_options = {"scheme": scheme} if scheme != "https" else {}
+        resp = http_get(host, port, path, ctx, timeout, max_body=65536,
+                        **request_options)
         if not resp or resp["status"] != 200:
             continue
 
@@ -1470,7 +1600,9 @@ def check_iocs(host, port, ctx, timeout) -> list:
         final_url = resp.get("final_url")
         if final_url:
             final = urlsplit(final_url)
-            if (final.hostname or "").lower() != host.lower() or (final.port or 443) != port:
+            default_port = 443 if scheme == "https" else 80
+            if ((final.hostname or "").lower() != host.lower()
+                    or (final.port or default_port) != port):
                 continue
             if posixpath.normpath(final.path) != posixpath.normpath(path):
                 continue
@@ -1496,11 +1628,7 @@ def check_iocs(host, port, ctx, timeout) -> list:
         ))
         has_webshell_code = strong_match or supporting_matches >= 2 or legacy_preg_replace
 
-        # Content preview (first 200 chars, sanitized)
-        preview = body_raw[:200].replace("\n", " ").replace("\r", "").strip()
-        if len(body_raw) > 200:
-            preview += "..."
-
+        first_finding = len(findings)
         if has_webshell_code:
             if is_stock_path and has_stock_content:
                 # Stock file with injected malicious code — potentially trojaned
@@ -1509,8 +1637,6 @@ def check_iocs(host, port, ctx, timeout) -> list:
                     "path": path,
                     "detail": f"POSSIBLY TROJANED stock file at {path} — contains suspicious code indicators. Validate on the appliance.",
                     "type": "trojaned_stock_file",
-                    "content_preview": preview,
-                    "content_size": body_len,
                 })
             else:
                 # Non-stock path with webshell code
@@ -1519,8 +1645,6 @@ def check_iocs(host, port, ctx, timeout) -> list:
                     "path": path,
                     "detail": f"POSSIBLE WEBSHELL at {path}. Validate on the appliance and investigate immediately.",
                     "type": "webshell",
-                    "content_preview": preview,
-                    "content_size": body_len,
                 })
         elif is_stock_path and has_stock_content:
             # Stock NetScaler file, legitimate content — NOT an IoC
@@ -1532,8 +1656,6 @@ def check_iocs(host, port, ctx, timeout) -> list:
                 "path": path,
                 "detail": f"Stock file at {path} has unexpected content — possible replacement.",
                 "type": "modified_stock_file",
-                "content_preview": preview,
-                "content_size": body_len,
             })
         else:
             # Non-stock IoC path with non-trivial content
@@ -1542,9 +1664,10 @@ def check_iocs(host, port, ctx, timeout) -> list:
                 "path": path,
                 "detail": f"Unexpected file at known IoC path {path} ({body_len} bytes). Review content.",
                 "type": "suspicious_file",
-                "content_preview": preview,
-                "content_size": body_len,
             })
+
+        for finding in findings[first_finding:]:
+            finding.update(response_evidence(resp))
 
     return findings
 
@@ -1608,14 +1731,15 @@ def is_actual_api_response(body: str, expected_type: str = "json") -> bool:
     return not is_login_page(body)
 
 
-def check_misconfigs(host, port, ctx, timeout, paths_tried) -> list:
+def check_misconfigs(host, port, ctx, timeout, paths_tried, scheme="https") -> list:
     """Check for security misconfigurations with login page false positive filtering."""
     findings = []
     for path in MISCONFIG_PATHS:
         if path in paths_tried:
             resp = paths_tried[path]
         else:
-            resp = http_get(host, port, path, ctx, timeout)
+            request_options = {"scheme": scheme} if scheme != "https" else {}
+            resp = http_get(host, port, path, ctx, timeout, **request_options)
         if resp and resp["status"] == 200:
             body_raw = resp.get("body", "")
             body = body_raw.lower()
@@ -1624,20 +1748,18 @@ def check_misconfigs(host, port, ctx, timeout, paths_tried) -> list:
             if is_login_page(body_raw):
                 continue  # Not actually accessible — just the login portal
 
-            # Content preview (sanitized, first 300 chars)
-            preview = body_raw[:300].replace("\n", " ").replace("\r", "").strip()
-            if len(body_raw) > 300:
-                preview += "..."
-
+            first_finding = len(findings)
             if path.startswith("/nitro/"):
                 # Verify it's actual JSON API response, not login page
                 if is_actual_api_response(body_raw, "json"):
-                    if "errorcode" not in body or '"errorcode": 0' in body.replace(" ", "").replace("'", '"'):
+                    payload = json.loads(body_raw)
+                    if (isinstance(payload, dict)
+                            and type(payload.get("errorcode")) is int
+                            and payload["errorcode"] == 0):
                         findings.append({
                             "severity": "CRITICAL" if "nsconfig" in path or "nsip" in path else "HIGH",
                             "path": path,
                             "detail": f"NITRO API endpoint accessible without authentication: {path}",
-                            "content_preview": preview[:200] if "nsconfig" in path or "nsip" in path else "",
                         })
             elif path in ("/menu/neo", "/menu/ss", "/gui/"):
                 # Verify actual management UI, not login redirect
@@ -1654,7 +1776,6 @@ def check_misconfigs(host, port, ctx, timeout, paths_tried) -> list:
                         "severity": "CRITICAL",
                         "path": path,
                         "detail": f"Configuration file accessible: {path}. Contains credentials.",
-                        "content_preview": preview,
                     })
             elif "ns.log" in path:
                 if is_actual_api_response(body_raw, "log"):
@@ -1662,7 +1783,6 @@ def check_misconfigs(host, port, ctx, timeout, paths_tried) -> list:
                         "severity": "CRITICAL",
                         "path": path,
                         "detail": f"Log file accessible: {path}. May contain session data.",
-                        "content_preview": preview,
                     })
             elif "nstrace" in path or "nslog" in path:
                 findings.append({
@@ -1670,6 +1790,8 @@ def check_misconfigs(host, port, ctx, timeout, paths_tried) -> list:
                     "path": path,
                     "detail": f"Diagnostic data exposed: {path}.",
                 })
+            for finding in findings[first_finding:]:
+                finding.update(response_evidence(resp))
     return findings
 
 
@@ -1729,7 +1851,8 @@ def build_recommendations(result: ScanResult) -> list:
         recs.append(f"  → Citrix guidance: {SAML_SECURITY_NOTICE['source']}")
         recs.append("POST-PATCH: A fixed build does not establish that the appliance was never compromised. Review NetScaler Console IoCs, logs, configuration changes, sessions, and credentials; preserve evidence if compromise is suspected.")
     if result.eol:
-        recs.append(f"URGENT: Branch {result.branch} is End-of-Life. Upgrade to 14.1-73.37+ immediately.")
+        recs.append(f"URGENT: The served build indicates End-of-Life branch {result.branch}. Confirm the running build on each node and plan an immediate supported upgrade.")
+        recs.append("  → For CVE-2026-88771, standard editions require at least 14.1-73.37 or 13.1-64.23 on a supported branch; check the Citrix bulletin for edition-specific fixes.")
     if result.exploited_itw_vulns > 0:
         itw_cves = [c["cve_id"] for c in result.cve_results if c.get("vulnerable") and c.get("exploited_itw")]
         recs.append(f"CRITICAL: {len(itw_cves)} CVE(s) with known in-the-wild exploitation: {', '.join(itw_cves)}")
@@ -1737,7 +1860,7 @@ def build_recommendations(result: ScanResult) -> list:
     if result.critical_cves > 0 or result.high_cves > 0:
         vuln_cves = [c["cve_id"] for c in result.cve_results if c.get("vulnerable")]
         if vuln_cves:
-            recs.append(f"PATCH: {len(vuln_cves)} CVE(s) applicable: {', '.join(vuln_cves[:10])}")
+            recs.append(f"OBSERVED BUILD: {len(vuln_cves)} version-based CVE candidate(s): {', '.join(vuln_cves[:10])}. Confirm the running build on each appliance before stating patch status.")
             # Find the highest fixed version needed
             max_fix = None
             for c in result.cve_results:
@@ -1749,7 +1872,9 @@ def build_recommendations(result: ScanResult) -> list:
                 recs.append(f"  → Minimum target version: {format_version(max_fix)}")
     if any(c.get("edition_unconfirmed") for c in result.cve_results):
         recs.append("EDITION UNKNOWN: Confirm FIPS/NDcPP status with 'show ns version' before interpreting the fixed build.")
-    if result.unassessed_cves:
+    if result.version_parsed and result.version_confidence not in ("", "HIGH"):
+        recs.append("VERSION CANDIDATE: A served page or asset suggests this build, but the evidence does not establish the running appliance build. Verify with authenticated NITRO or 'show ns version' on every node.")
+    if result.unassessed_cves and result.version_confidence == "HIGH":
         recs.append(f"EDITION COVERAGE: {len(result.unassessed_cves)} CVE(s) unassessed for {result.branch}; verify their edition-specific status on the appliance.")
     if any(f.get("severity") == "CRITICAL" for f in result.misconfig_findings):
         recs.append("MISCONFIG: Critical security misconfiguration(s) detected.")
@@ -1769,12 +1894,10 @@ def build_recommendations(result: ScanResult) -> list:
         if result.rdx_en_status:
             recs.append(f"  → Fingerprint diagnostic: {result.rdx_en_status}")
         if result.saml_idp_detected or result.gateway_detected:
-            recs.append("  → Vulnerable config detected. ASSUME VULNERABLE until version confirmed.")
-        if result.epa_available:
-            recs.append("  → EPA binary downloadable. Download nsepa_setup.exe and check file properties for version.")
-        recs.append("  → Or use NITRO API with credentials: curl -k -u nsroot:pass https://<IP>/nitro/v1/config/nsversion")
+            recs.append("  → Gateway or authentication features are visible; prioritize owner-side version and configuration review.")
+        recs.append("  → Confirm the running build and edition on every node with 'show ns version' or authenticated NITRO on the management network.")
         if result.etag_values:
-            recs.append(f"  → ETag fingerprints collected ({len(result.etag_values)} paths) — compare against known builds for identification.")
+            recs.append(f"  → ETag hashes collected for {len(result.etag_values)} paths; use only as served-content correlation clues.")
     if not result.is_netscaler and result.reachable:
         recs.append("Target is reachable but not identified as NetScaler. Verify asset inventory.")
     return recs
@@ -1786,13 +1909,18 @@ def build_recommendations(result: ScanResult) -> list:
 
 def scan_target(target: str, port: int = 443, timeout: int = 15,
                 modules: str = "all", deep_scan: bool = True,
-                saml_review: Optional[dict] = None) -> ScanResult:
+                saml_review: Optional[dict] = None, scheme: str = "https",
+                corpus: Optional[dict] = None) -> ScanResult:
     """Full-scope security scan of a single target."""
+    if scheme not in ("http", "https", "auto"):
+        raise ValueError("scheme must be http, https, or auto")
     start_time = datetime.now(timezone.utc)
     result = ScanResult(
         target=target, ip=target, port=port,
         timestamp=start_time.isoformat(), modules_run=modules,
+        http_scheme=scheme,
     )
+    request_options = {"scheme": scheme} if scheme != "https" else {}
     if saml_review:
         result.saml_advisory_status = saml_review["status"]
         result.saml_advisory_signals = saml_review["signals"]
@@ -1800,7 +1928,10 @@ def scan_target(target: str, port: int = 443, timeout: int = 15,
 
     # ── DNS ──
     try:
-        result.ip = socket.gethostbyname(target)
+        try:
+            result.ip = str(ipaddress.ip_address(target))
+        except ValueError:
+            result.ip = socket.gethostbyname(target)
     except socket.gaierror as e:
         result.errors.append(f"DNS resolution failed: {e}")
         result.recommendations = build_recommendations(result)
@@ -1816,7 +1947,14 @@ def scan_target(target: str, port: int = 443, timeout: int = 15,
         return result
 
     # ── TLS ──
-    tls_info = get_tls_info(target, port, ctx)
+    tls_info = (get_tls_info(target, port, ctx, timeout=timeout)
+                if scheme in ("https", "auto") else
+                {"protocol": "", "cipher": "", "bits": 0, "cn": "", "san": "",
+                 "issuer": "", "not_after": ""})
+    if scheme == "auto":
+        scheme = "https" if tls_info.get("protocol") else "http"
+        result.http_scheme = scheme
+        request_options = {"scheme": scheme} if scheme != "https" else {}
     result.tls_protocol = tls_info["protocol"]
     result.tls_cipher = tls_info["cipher"]
     result.tls_bits = tls_info["bits"]
@@ -1824,33 +1962,52 @@ def scan_target(target: str, port: int = 443, timeout: int = 15,
     result.tls_san = tls_info["san"]
     result.tls_issuer = tls_info["issuer"]
     result.tls_expiry = tls_info["not_after"]
-    if "tls" in modules or modules == "all":
+    if scheme == "https" and ("tls" in modules or modules == "all"):
         result.tls_findings = audit_tls(tls_info)
 
     # ── Phase 1: Standard Fingerprinting ──
     responses = []
     paths_tried = {}
     for path in FINGERPRINT_PATHS:
-        resp = http_get(target, port, path, ctx, timeout)
+        resp = http_get(target, port, path, ctx, timeout, **request_options)
         responses.append(resp)
         paths_tried[path] = resp
         if resp:
             result.accessible_paths.append(f"{path} [{resp['status']}]")
+            if path == "/vpn/index.html" and resp.get("body"):
+                result.response_hashes[path] = hashlib.sha256(
+                    resp["body"].encode("utf-8", errors="replace")
+                ).hexdigest()
+                tokens = sorted(set(re.findall(r"\?v=([0-9a-f]{32})(?![0-9a-z_])",
+                                               resp["body"], re.IGNORECASE)))
+                if tokens:
+                    result.asset_fingerprints["vpn_index_v"] = [t.lower() for t in tokens[:8]]
             if not result.server_header:
-                result.server_header = resp["headers"].get("Server", "")
-            etag = resp["headers"].get("ETag", "")
+                result.server_header = classified_server_header(
+                    header_value(resp["headers"], "Server"))
+            etag = header_value(resp["headers"], "ETag")
             if etag:
-                result.etag_values.append(f"{path}: {etag}")
+                result.etag_values.append(
+                    f"{path}: sha256={hashlib.sha256(etag.encode('utf-8', errors='replace')).hexdigest()}")
 
-    root_resp = http_get(target, port, "/", ctx, timeout)
+    root_resp = http_get(target, port, "/", ctx, timeout, **request_options)
     responses.append(root_resp)
     if root_resp:
         result.accessible_paths.append(f"/ [{root_resp['status']}]")
     if not any(resp is not None for resp in responses):
-        result.errors.append("No HTTPS response received; product identification and vulnerability assessment are incomplete.")
+        result.errors.append(f"No {scheme.upper()} response received; product identification and vulnerability assessment are incomplete.")
 
     # Product detection
-    result.is_netscaler = detect_product(responses, tls_info)
+    result.is_netscaler = detect_live_product(responses, tls_info)
+    if not result.is_netscaler:
+        # A generic proxy may hide the portal while exposing a genuine NITRO
+        # response. A successful, schema-valid response is a product signal.
+        path = "/nitro/v1/config/nsversion"
+        nitro_resp = http_get(target, port, path, ctx, timeout, **request_options)
+        if extract_nitro_version(nitro_resp, nitro_path=True):
+            result.is_netscaler = True
+            paths_tried[path] = nitro_resp
+            result.accessible_paths.append(f"{path} [{nitro_resp['status']}]")
     if not result.is_netscaler:
         result.risk_rating = calculate_risk(result)
         result.recommendations = build_recommendations(result)
@@ -1860,20 +2017,27 @@ def scan_target(target: str, port: int = 443, timeout: int = 15,
     # ── Phase 2: Extended Probing ──
     extended_responses = []
     for path in EXTENDED_PATHS:
-        resp = http_get(target, port, path, ctx, timeout)
+        resp = paths_tried.get(path)
+        if resp is None:
+            resp = http_get(target, port, path, ctx, timeout, **request_options)
         extended_responses.append(resp)
         paths_tried[path] = resp
         if resp:
-            result.accessible_paths.append(f"{path} [{resp['status']}]")
-            etag = resp["headers"].get("ETag", "")
+            if f"{path} [{resp['status']}]" not in result.accessible_paths:
+                result.accessible_paths.append(f"{path} [{resp['status']}]")
+            if path == "/nitro/v1/config/nsversion" and resp.get("body"):
+                result.response_hashes[path] = hashlib.sha256(
+                    resp["body"].encode("utf-8", errors="replace")
+                ).hexdigest()
+            etag = header_value(resp["headers"], "ETag")
             if etag:
-                result.etag_values.append(f"{path}: {etag}")
+                result.etag_values.append(
+                    f"{path}: sha256={hashlib.sha256(etag.encode('utf-8', errors='replace')).hexdigest()}")
             if "/nitro/v1/config/nsversion" in path and resp["status"] in (200, 401, 403):
                 body = resp.get("body", "")
-                if resp["status"] in (401, 403):
-                    result.nitro_accessible = True  # Auth required = real NITRO endpoint
-                elif resp["status"] == 200 and not is_login_page(body):
-                    result.nitro_accessible = True  # 200 with actual data = accessible
+                result.nitro_accessible = bool(
+                    extract_nitro_version(resp, nitro_path=True)
+                )
 
     # Config detection
     config = detect_config(responses + extended_responses, paths_tried)
@@ -1887,7 +2051,8 @@ def scan_target(target: str, port: int = 443, timeout: int = 15,
     # Version extraction
     ver_raw, ver_src, ver_conf, ver_diag = extract_version(
         responses, extended_responses, paths_tried, ctx, target, port, timeout,
-        allow_epa_download=deep_scan
+        allow_epa_download=deep_scan, scheme=scheme,
+        evidence_out=result.version_evidence, corpus=corpus
     )
     result.version_raw = ver_raw
     result.version_source = ver_src
@@ -1896,7 +2061,8 @@ def scan_target(target: str, port: int = 443, timeout: int = 15,
 
     # Check EPA availability (HEAD check if not already done during version extraction)
     for epa_path in EPA_PATHS:
-        head = http_get(target, port, epa_path, ctx, timeout, method="HEAD")
+        head = http_get(target, port, epa_path, ctx, timeout,
+                        method="HEAD", **request_options)
         if head and head["status"] == 200:
             result.epa_available = True
             result.accessible_paths.append(f"{epa_path} [200/HEAD]")
@@ -1911,11 +2077,14 @@ def scan_target(target: str, port: int = 443, timeout: int = 15,
             result.version_display += " FIPS"
         elif result.branch.endswith("-NDcPP"):
             result.version_display += " NDcPP"
-        result.eol = f"{result.version_parsed[0]}.{result.version_parsed[1]}" in EOL_BRANCHES
+        result.eol = (result.version_confidence == "HIGH" and
+                      f"{result.version_parsed[0]}.{result.version_parsed[1]}" in EOL_BRANCHES)
 
     # ── CVE Assessment ──
     if "cve" in modules or modules == "all":
-        if result.version_parsed:
+        if not result.version_parsed or result.version_confidence != "HIGH":
+            result.unassessed_cves.append("CVE-2026-88771")
+        if result.version_parsed and result.version_confidence == "HIGH":
             for cve in CVE_DATABASE:
                 res = check_cve_applicability(result.version_parsed, config, cve,
                                               version_raw=result.version_raw)
@@ -1930,6 +2099,7 @@ def scan_target(target: str, port: int = 443, timeout: int = 15,
                 res["public_poc"] = cve.public_poc
                 res["advisory"] = cve.advisory
                 res["affected_config"] = cve.affected_config
+                res["evidence_scope"] = "served_build_only"
                 if res["vulnerable"]:
                     result.cve_results.append(res)
                     result.total_vulns += 1
@@ -1942,11 +2112,12 @@ def scan_target(target: str, port: int = 443, timeout: int = 15,
 
     # ── IoC Detection ──
     if "ioc" in modules or modules == "all":
-        result.ioc_findings = check_iocs(target, port, ctx, timeout)
+        result.ioc_findings = check_iocs(target, port, ctx, timeout, scheme=scheme)
 
     # ── Misconfiguration Checks ──
     if "misconfig" in modules or modules == "all":
-        result.misconfig_findings = check_misconfigs(target, port, ctx, timeout, paths_tried)
+        result.misconfig_findings = check_misconfigs(target, port, ctx, timeout,
+                                                     paths_tried, scheme=scheme)
 
     # ── Security Headers ──
     if "headers" in modules or modules == "all":
@@ -1958,6 +2129,35 @@ def scan_target(target: str, port: int = 443, timeout: int = 15,
     result.scan_duration = (datetime.now(timezone.utc) - start_time).total_seconds()
 
     return result
+
+
+def mark_repeated_content(results: list) -> None:
+    """Annotate cross-host identical content without erasing build evidence.
+
+    Identical login and NITRO bodies on at least three distinct IPs may be a
+    shared backend, proxy, cache, or a fleet on the same build. Equality alone
+    cannot decide which explanation is correct, so version-based CVE candidates
+    remain visible while per-node patch status remains unverified.
+    """
+    cohorts = {}
+    for result in results:
+        hashes = result.response_hashes
+        login_hash = hashes.get("/vpn/index.html")
+        nitro_hash = hashes.get("/nitro/v1/config/nsversion")
+        if login_hash and nitro_hash:
+            cohorts.setdefault((login_hash, nitro_hash), []).append(result)
+    for cohort in cohorts.values():
+        host_count = len({result.ip for result in cohort})
+        if host_count < 3:
+            continue
+        for result in cohort:
+            result.shared_response_hosts = host_count
+            result.patch_status = "unverified_shared_response"
+            result.recommendations.append(
+                f"TRIAGE: Two live response bodies were identical across {host_count} "
+                "different IPs. This may reflect a fleet on one build or shared "
+                "upstream content; verify each appliance's running version and HA peers."
+            )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2000,7 +2200,8 @@ def print_result(r: ScanResult, verbose: bool = False):
     if r.branch:
         eol_tag = f" \033[91m[EOL]{R}" if r.eol else ""
         print(f"  Branch     : {r.branch}{eol_tag}")
-    print(f"  Server     : {r.server_header or 'N/A'}")
+    print(f"  Server     : {classified_server_header(r.server_header) or 'N/A'}")
+    print(f"  Patch status: {r.patch_status}; confirm the running build on every node")
 
     # Config
     print(f"\n  {B}Configuration:{R}")
@@ -2026,7 +2227,7 @@ def print_result(r: ScanResult, verbose: bool = False):
 
     # CVEs
     if r.cve_results:
-        print(f"\n  {B}Vulnerabilities ({r.total_vulns} found):{R}")
+        print(f"\n  {B}Served-build CVE candidates ({r.total_vulns}):{R}")
         for cv in sorted(r.cve_results, key=lambda x: x["cvss"], reverse=True):
             sc = COLORS.get(cv["severity"], "")
             itw = " 🔥 EXPLOITED-ITW" if cv.get("exploited_itw") else ""
@@ -2045,9 +2246,9 @@ def print_result(r: ScanResult, verbose: bool = False):
                 print(f"      → Fix: {cv['fixed_version']}  ({cv.get('advisory','')})")
     elif r.version_parsed and (r.modules_run == "all" or "cve" in r.modules_run):
         if r.unassessed_cves:
-            print(f"\n  {B}Vulnerabilities:{R} None confirmed; {len(r.unassessed_cves)} CVE(s) unassessed for {r.branch}")
+            print(f"\n  {B}Vulnerabilities:{R} {len(r.unassessed_cves)} CVE(s) unassessed for {r.branch or 'unknown build'}")
         else:
-            print(f"\n  {B}Vulnerabilities:{R} \033[92mNo modeled CVEs found for {r.version_display}{R}")
+            print(f"\n  {B}Vulnerabilities:{R} No modeled CVE candidates for served build {r.version_display}; patch state unverified")
     elif r.version_parsed:
         print(f"\n  {B}Vulnerabilities:{R} CVE module not run")
     if r.unassessed_cves:
@@ -2059,8 +2260,9 @@ def print_result(r: ScanResult, verbose: bool = False):
         for ioc in r.ioc_findings:
             sev_c = COLORS.get(ioc['severity'], "")
             print(f"    [{sev_c}{ioc['severity']:8s}{R}] {ioc['detail']}")
-            if ioc.get("content_preview"):
-                print(f"      Content ({ioc.get('content_size', '?')} bytes): {ioc['content_preview'][:150]}")
+            if ioc.get("content_sha256"):
+                print(f"      Response: HTTP {ioc.get('http_status', '?')}, "
+                      f"{ioc.get('content_size', '?')} bytes, SHA256 {ioc['content_sha256']}")
 
     # Misconfigs
     if r.misconfig_findings:
@@ -2068,8 +2270,9 @@ def print_result(r: ScanResult, verbose: bool = False):
         for mc in r.misconfig_findings:
             mc_c = COLORS.get(mc["severity"], "")
             print(f"    [{mc_c}{mc['severity']:8s}{R}] {mc['detail']}")
-            if mc.get("content_preview"):
-                print(f"      Content: {mc['content_preview'][:200]}")
+            if mc.get("content_sha256"):
+                print(f"      Response: HTTP {mc.get('http_status', '?')}, "
+                      f"{mc.get('content_size', '?')} bytes, SHA256 {mc['content_sha256']}")
 
     # Risk
     print(f"\n  {B}Overall Risk: {c}{r.risk_rating}{R}")
@@ -2147,6 +2350,20 @@ def export_json(results: list, filepath: str, modules="all", failed_targets=None
     for r in results:
         d = asdict(r)
         d["version_parsed"] = list(r.version_parsed) if r.version_parsed else None
+        d["server_header"] = classified_server_header(r.server_header)
+        d["etag_values"] = [
+            value if re.fullmatch(r"/[A-Za-z0-9_./-]+: sha256=[0-9a-f]{64}", value)
+            else f"sha256={hashlib.sha256(str(value).encode('utf-8', errors='replace')).hexdigest()}"
+            for value in r.etag_values
+        ]
+        allowed_finding_fields = {"severity", "path", "detail", "type",
+                                  "http_status", "content_size", "content_sha256"}
+        for field_name in ("ioc_findings", "misconfig_findings"):
+            d[field_name] = [
+                {key: value for key, value in finding.items()
+                 if key in allowed_finding_fields}
+                for finding in d[field_name]
+            ]
         export.append(d)
     with open(filepath, "w") as f:
         json.dump({
@@ -2180,7 +2397,7 @@ def export_csv(results: list, filepath: str, failed_targets=None, saml_review=No
     failed_targets = failed_targets or []
     fields = [
         "target", "scan_status", "errors", "ip", "port", "modules_run", "reachable", "is_netscaler", "version_display",
-        "branch", "eol", "version_source", "version_confidence",
+        "branch", "eol", "version_source", "version_confidence", "patch_status",
         "saml_idp_detected", "oauth_idp_detected", "gateway_detected", "aaa_detected", "mgmt_exposed",
         "saml_advisory_status", "saml_advisory_signals",
         "tls_protocol", "tls_cipher", "tls_bits",
@@ -2252,13 +2469,14 @@ def export_markdown(results: list, filepath: str, failed_targets=None,
             f.write(f"### {risk_emoji} {r.target}:{r.port}\n\n")
             f.write(f"- **Risk:** {r.risk_rating}\n")
             f.write(f"- **Version:** {r.version_display or 'Unknown'}\n")
+            f.write(f"- **Patch status:** {r.patch_status}; confirm the running build on every node\n")
             f.write(f"- **Branch:** {r.branch or 'N/A'} {'(EOL)' if r.eol else ''}\n")
             f.write(f"- **SAML IDP:** {'Yes' if r.saml_idp_detected else 'No'}\n")
             f.write(f"- **October 2 SAML review:** {r.saml_advisory_status}\n")
             f.write(f"- **OAuth IdP:** {'Yes' if r.oauth_idp_detected else 'No'}\n")
             f.write(f"- **Gateway:** {'Yes' if r.gateway_detected else 'No'}\n")
             if r.modules_run == "all" or "cve" in r.modules_run:
-                f.write(f"- **CVEs:** {r.total_vulns} ({r.critical_cves} critical, {r.exploited_itw_vulns} exploited-ITW)\n\n")
+                f.write(f"- **Served-build CVE candidates:** {r.total_vulns} ({r.critical_cves} critical, {r.exploited_itw_vulns} exploited-ITW)\n\n")
             else:
                 f.write("- **CVEs:** Not assessed (CVE module not run)\n\n")
             if r.unassessed_cves:
@@ -2513,6 +2731,68 @@ def analyze_shodan_export(filepath) -> dict:
     }
 
 
+def load_live_shodan_targets(filepath) -> list:
+    """Select HTTP services from a JSONL export without trusting its body text.
+
+    The destination is always the validated IP and port in each record.
+    Shodan hostnames, redirect URLs, and HTML never become scan destinations.
+    """
+    targets = {}
+    with open(filepath, encoding="utf-8") as source:
+        for line_number, line in enumerate(source, 1):
+            if not line.strip():
+                continue
+            try:
+                item = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"line {line_number}: invalid JSON") from exc
+            if not isinstance(item, dict):
+                raise ValueError(f"line {line_number}: expected JSON object")
+            ip = item.get("ip_str")
+            port = item.get("port")
+            try:
+                parsed = ipaddress.ip_address(ip)
+            except (ValueError, TypeError) as exc:
+                raise ValueError(f"line {line_number}: invalid IP address") from exc
+            if getattr(parsed, "scope_id", None) is not None:
+                raise ValueError(f"line {line_number}: scoped IP address is unsupported")
+            if not isinstance(port, int) or isinstance(port, bool) or not 1 <= port <= 65535:
+                raise ValueError(f"line {line_number}: invalid port")
+            raw = item.get("data")
+            if not isinstance(item.get("http"), dict) and not (
+                isinstance(raw, str) and raw.startswith("HTTP/")
+            ):
+                raise ValueError(f"line {line_number}: not an HTTP service record")
+            key = (str(parsed), port)
+            # Cached TLS metadata is historical; detect the current transport.
+            targets[key] = "auto"
+    return [(ip, port, scheme) for (ip, port), scheme in targets.items()]
+
+
+def load_firmware_corpus(filepath) -> dict:
+    """Load an operator-built fingerprint corpus with bounded schema checks."""
+    with open(filepath, encoding="utf-8") as source:
+        corpus = json.load(source)
+    if not isinstance(corpus, dict) or corpus.get("schema_version") != 1:
+        raise ValueError("unsupported firmware corpus schema")
+    fingerprints = corpus.get("fingerprints")
+    if not isinstance(fingerprints, dict):
+        raise ValueError("firmware corpus has no fingerprints")
+    for kind in ("vpn_index_v", "rdx_en_gzip_mtime"):
+        entries = fingerprints.get(kind)
+        if not isinstance(entries, dict):
+            raise ValueError(f"firmware corpus is missing {kind}")
+        for key, candidates in entries.items():
+            if not isinstance(key, str) or not isinstance(candidates, list):
+                raise ValueError(f"invalid {kind} entry")
+            if any(not isinstance(candidate, dict) or
+                   not isinstance(candidate.get("build"), str) or
+                   not parse_netscaler_version(candidate["build"])
+                   for candidate in candidates):
+                raise ValueError(f"invalid {kind} build candidate")
+    return corpus
+
+
 class ScannerArgumentParser(argparse.ArgumentParser):
     def error(self, message):
         self.print_usage(sys.stderr)
@@ -2529,7 +2809,13 @@ def main():
     parser.add_argument("-f", "--file", help="Target list file (one per line)")
     parser.add_argument("--shodan-export", metavar="FILE",
                         help="Triage Shodan JSON Lines offline without contacting listed hosts")
-    parser.add_argument("-p", "--port", type=int, default=443, help="HTTPS port (default: 443)")
+    parser.add_argument("--live-shodan-export", metavar="FILE",
+                        help="Scan each authorized HTTP service IP:port in Shodan JSON Lines")
+    parser.add_argument("-p", "--port", type=int, default=443, help="Target port (default: 443)")
+    parser.add_argument("--scheme", choices=("http", "https"), default="https",
+                        help="HTTP protocol for ordinary targets (default: https)")
+    parser.add_argument("--firmware-corpus", metavar="FILE",
+                        help="Match live stock fingerprints to a local firmware corpus")
     parser.add_argument("-t", "--timeout", type=int, default=15, help="Timeout per request (default: 15s)")
     parser.add_argument("--threads", type=int, default=5, help="Concurrent threads (default: 5)")
     parser.add_argument("-o", "--output-json", help="JSON report output path")
@@ -2568,8 +2854,9 @@ def main():
         sys.exit(0)
 
     if args.shodan_export:
-        if args.targets or args.file or args.saml_config or args.fail_on_saml_match:
-            parser.error("--shodan-export cannot be combined with live targets or SAML configuration")
+        if (args.targets or args.file or args.saml_config or args.fail_on_saml_match
+                or args.live_shodan_export or args.firmware_corpus):
+            parser.error("--shodan-export cannot be combined with live targets, a firmware corpus, or SAML configuration")
         if args.output_csv or args.output_md or args.fail_on_risk:
             parser.error("--shodan-export supports JSON output only; live risk flags do not apply")
         if args.modules not in ("all", "cve"):
@@ -2592,6 +2879,19 @@ def main():
         print("Cached banner triage only; verify build and edition on the appliance.")
         return 1 if summary["invalid_records"] or not summary["records"] else 0
 
+    corpus = None
+    if args.firmware_corpus:
+        try:
+            corpus = load_firmware_corpus(args.firmware_corpus)
+        except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as exc:
+            print(f"[!] Could not load firmware corpus: {exc}", file=sys.stderr)
+            return 1
+
+    if args.live_shodan_export and (args.targets or args.file or args.saml_config):
+        parser.error("--live-shodan-export cannot be combined with ordinary targets or SAML configuration")
+    if args.live_shodan_export and args.port != 443:
+        parser.error("--live-shodan-export uses each record's port; omit --port")
+
     targets = list(args.targets) if args.targets else []
     if args.file:
         try:
@@ -2604,13 +2904,24 @@ def main():
             print(f"[!] File not found: {args.file}", file=sys.stderr)
             sys.exit(1)
 
-    if not targets:
+    if not targets and not args.live_shodan_export:
         print(BANNER)
         parser.print_help()
         sys.exit(1)
 
     targets = list(dict.fromkeys(targets))
-    if args.saml_config and len(targets) != 1:
+    if args.live_shodan_export:
+        try:
+            scan_specs = load_live_shodan_targets(args.live_shodan_export)
+        except (OSError, UnicodeError, ValueError) as exc:
+            print(f"[!] Could not load live Shodan targets: {exc}", file=sys.stderr)
+            return 1
+        if not scan_specs:
+            print("[!] Shodan export contains no HTTP services", file=sys.stderr)
+            return 1
+    else:
+        scan_specs = [(target, args.port, args.scheme) for target in targets]
+    if args.saml_config and len(scan_specs) != 1:
         parser.error("--saml-config requires exactly one target")
     if args.fail_on_saml_match and not args.saml_config:
         parser.error("--fail-on-saml-match requires --saml-config")
@@ -2624,7 +2935,7 @@ def main():
             return 1
 
     print(BANNER)
-    print(f"  Targets: {len(targets)} │ Port: {args.port} │ Threads: {args.threads}")
+    print(f"  Targets: {len(scan_specs)} │ Port: {'per record' if args.live_shodan_export else args.port} │ Threads: {args.threads}")
     print(f"  Modules: {args.modules} │ CVE DB: {len(CVE_DATABASE)} entries")
     if saml_review:
         print(f"  Local SAML configuration review: {saml_review['status']}")
@@ -2634,33 +2945,44 @@ def main():
     results = []
     failed_targets = []
     with ThreadPoolExecutor(max_workers=args.threads) as executor:
+        def submit_one(ip, port, scheme):
+            scan_args = (ip, port, args.timeout, args.modules,
+                         not args.no_deep, saml_review)
+            if corpus is not None:
+                return executor.submit(scan_target, *scan_args, scheme, corpus)
+            if scheme != "https":
+                return executor.submit(scan_target, *scan_args, scheme)
+            return executor.submit(scan_target, *scan_args)
+
         futures = {
-            executor.submit(scan_target, t, args.port, args.timeout, args.modules,
-                            not args.no_deep, saml_review): t
-            for t in targets
+            submit_one(ip, port, scheme):
+                (f"{ip}:{port}" if args.live_shodan_export else ip)
+            for ip, port, scheme in scan_specs
         }
         for future in as_completed(futures):
             try:
                 result = future.result()
                 results.append(result)
-                print_result(result, verbose=args.verbose)
             except Exception as e:
                 failed_targets.append(futures[future])
                 print(f"[!] Error scanning {futures[future]}: {e}", file=sys.stderr)
 
+    mark_repeated_content(results)
     risk_order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4, "UNKNOWN": 5}
     results.sort(key=lambda r: risk_order.get(r.risk_rating, 5))
+    for result in results:
+        print_result(result, verbose=args.verbose)
 
-    print_summary(results, failed_targets, len(targets))
+    print_summary(results, failed_targets, len(scan_specs))
 
     try:
         if args.output_json:
             export_json(results, args.output_json, args.modules, failed_targets,
-                        len(targets), saml_review)
+                        len(scan_specs), saml_review)
         if args.output_csv:
             export_csv(results, args.output_csv, failed_targets, saml_review)
         if args.output_md:
-            export_markdown(results, args.output_md, failed_targets, len(targets), saml_review)
+            export_markdown(results, args.output_md, failed_targets, len(scan_specs), saml_review)
     except OSError as e:
         print(f"[!] Could not write report: {e}", file=sys.stderr)
         return 1
