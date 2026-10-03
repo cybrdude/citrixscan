@@ -1,19 +1,19 @@
 # CitrixScan
 
-**Full-scope external security scanner for Citrix NetScaler ADC and NetScaler Gateway appliances.**
+**External security scanner for Citrix NetScaler ADC and NetScaler Gateway appliances.**
 ---
 
 ## What It Does
 
-CitrixScan performs a comprehensive, non-exploitative security assessment of internet-facing Citrix NetScaler appliances. It identifies the firmware version, maps it against 26 known CVEs spanning 2019–2026, detects vulnerable configurations, checks for indicators of compromise, and audits TLS and security headers — all without authentication.
+CitrixScan performs a non-exploitative security assessment of internet-facing Citrix NetScaler appliances. It collects build evidence, maps observed versions against 26 known CVEs spanning 2019–2026, screens detectable configurations and selected indicators of compromise (IoCs), and audits TLS and security headers — all without appliance authentication. A public response can come from a cache, virtual host, proxy, or HA node. External evidence cannot establish the current patch state of every appliance behind an address; confirm the running build and edition on each node.
 
 ### Scan Modules
 
 | Module | What It Checks |
 |---|---|
-| **Version Fingerprinting** | 10 detection vectors including GZIP timestamp extraction (Fox-IT technique), NITRO API probing, EPA binary PE analysis, HTTP header parsing, and static resource hashing |
+| **Version Fingerprinting** | NITRO version responses, GZIP timestamps (Fox-IT technique), HTTP headers, body patterns, and stock resource fingerprints. EPA binary metadata is reported only as a client inventory clue. |
 | **CVE Assessment** | 26 CVEs with version-to-fix mapping, configuration prerequisite validation, in-the-wild exploitation tracking, and public PoC status |
-| **IoC Detection** | 15 known webshell/backdoor paths from CVE-2023-3519 campaigns, CISA AA23-201A indicators, with content-based analysis that distinguishes stock NetScaler files from actual implants |
+| **IoC Detection** | 15 paths associated with webshell activity, primarily from CVE-2023-3519 campaigns and CISA AA23-201A; content checks help prioritize investigation, but cannot prove or rule out compromise |
 | **Misconfiguration Audit** | 12 paths checked for exposed management interfaces, unauthenticated NITRO API access, configuration file exposure, and diagnostic data leaks — with login-page false positive filtering |
 | **TLS Audit** | Protocol version, cipher strength, deprecated cipher detection, certificate expiry |
 | **Security Headers** | HSTS, X-Frame-Options, CSP, X-Content-Type-Options, server version disclosure |
@@ -34,30 +34,77 @@ python3 citrixscan.py 10.0.0.1 10.0.0.2 10.0.0.3 \
 # Bulk scan from file
 python3 citrixscan.py -f targets.txt --threads 10 -o results.json
 
+# Triage cached Shodan JSONL records without contacting listed hosts
+python3 citrixscan.py --shodan-export shodan.jsonl -o shodan-triage.json
+
+# Scan authorized HTTP services at each IP:port in that export
+python3 citrixscan.py --live-shodan-export shodan.jsonl \
+  --modules cve --no-deep --threads 4 -o live-evidence.json
+
+# Optional Host/SNI follow-up after explicitly approving each FQDN on its IP:port
+# approved-hostnames.csv must have exactly: ip,port,hostname
+python3 vhost_followup.py --shodan-export shodan.jsonl \
+  --live-report live-evidence.json --approved-hostnames approved-hostnames.csv \
+  --output-json vhost-evidence.json
+
+# Scan one plain HTTP service (HTTPS remains the default)
+python3 citrixscan.py 10.0.0.1 --scheme http -p 8080 --modules cve
+
+# Build a local reference corpus from vendor firmware packages you obtained
+python3 -m firmware_corpus -o corpus.json package1.tgz package2.tgz
+python3 citrixscan.py 10.0.0.1 --firmware-corpus corpus.json -o live-evidence.json
+
 # List all CVEs in the database
 python3 citrixscan.py --list-cves
 
 # Skip EPA binary download (faster scan)
 python3 citrixscan.py 10.0.0.1 --no-deep -v
+
+# Alert an automation when a target reaches HIGH or CRITICAL risk
+python3 citrixscan.py 10.0.0.1 --fail-on-risk high -o report.json
+
+# Screen a local ns.conf for the separate NetScaler SAML advisory
+python3 citrixscan.py 10.0.0.1 --saml-config /path/to/ns.conf --fail-on-saml-match
 ```
 
 ### Requirements
 
 - **Python 3.8+**
 - **No external dependencies** — stdlib only
-- Network access to target(s) on HTTPS port
+- Network access to each authorized HTTP or HTTPS target and port for live scans
+
+---
+
+## Offline Shodan Export Triage
+
+Use `--shodan-export FILE` with a locally saved Shodan JSONL export (one JSON object per line). This mode reads cached service banners and makes **zero connections to the listed hosts**. It does not perform the live HTTP, TLS, configuration, or IoC checks described below. Use `-o FILE` to save a sanitized JSON report; raw banners and cookies are not included in that report.
+
+The report classifies firmware version evidence as **consistent**, **conflicting**, or **unknown**. A CVE-2026-88771 **candidate** means the cached evidence warrants follow-up against [Citrix bulletin CTX697096](https://support.citrix.com/external/article/CTX697096/netscaler-adc-and-netscaler-gateway-secu.html). Shodan observations may be old, incomplete, or from a different virtual host. Cached banners cannot confirm a device's current build, edition, configuration, patch state, or compromise status. Verify candidates on appliances you are authorized to assess before notifying an owner that a vulnerability is present.
+
+`-f FILE` remains a list of live scan targets, one IP or hostname per line. Do not use `-f` for a Shodan export.
+
+`--live-shodan-export FILE` makes live requests to every validated HTTP service IP:port in the export. For every record it tests TLS first and uses HTTPS when the handshake succeeds; otherwise it uses HTTP. Cached Shodan TLS metadata does not lock the live protocol choice. The scan ignores Shodan redirect destinations and hostnames as destinations, and follows only redirects that stay on the same scheme, IP, and port. Use this mode only for endpoints you are authorized to scan. Identical login and NITRO response bodies across multiple IPs are noted as a shared-content clue. The annotation preserves observed build evidence and version-based CVE candidates; it does not establish whether those IPs share an appliance.
+
+`vhost_followup.py` is an optional, bounded follow-up for unresolved live NetScaler results. Create a CSV file with the exact header `ip,port,hostname` and one row per explicitly approved IP:port/FQDN combination. It intersects that allowlist with hostnames in the Shodan export, pins every TCP connection to the approved IP:port, and uses the FQDN only for HTTP Host and HTTPS SNI. It does not follow redirects. At most two approved hostnames per endpoint and three stock paths per hostname are probed. The output is a sanitized evidence report with `patch_status: not_assessed`; a returned build is a candidate for owner verification.
+
+For example, an approval file for a test address has this shape:
+
+```csv
+ip,port,hostname
+192.0.2.10,443,gateway.example.com
+```
 
 ---
 
 ## Version Fingerprinting
 
-Identifying the firmware version is the foundation of vulnerability assessment. CitrixScan uses 10 detection vectors, tried in priority order:
+Identifying the firmware version is the foundation of vulnerability assessment. CitrixScan collects live clues from several sources and reports numeric-build or edition conflicts instead of selecting the first version it sees. A live external clue describes what that endpoint served during the scan; it is not a per-node patch attestation.
 
-### 1. GZIP Timestamp Extraction (Primary — Highest Accuracy)
+### 1. GZIP Timestamp Extraction (Primary External Fingerprint)
 
-The most reliable unauthenticated fingerprinting technique available. Every NetScaler build ships a compressed language resource file at `/vpn/js/rdx/core/lang/rdx_en.json.gz`. The GZIP file format (RFC 1952) stores a modification timestamp in bytes 4-8 of the header (`MTIME` field). This timestamp is set during firmware compilation and uniquely identifies the build.
+Fox-IT found that many NetScaler builds expose a compressed language resource at `/vpn/js/rdx/core/lang/rdx_en.json.gz`. Its GZIP header stores a modification timestamp in bytes 4-7 (`MTIME`), which can be matched to a known build. This is a fingerprint of a served file, so confirm the running build on the appliance when making a patch-status decision.
 
-CitrixScan embeds a **228-entry lookup table** mapping known timestamps to exact firmware versions, covering every release from 12.1-49.23 (August 2018) through 14.1-66.59 (November 2025).
+CitrixScan embeds a **228-entry lookup table** mapping known timestamps to firmware versions, including builds from 12.1-49.23 (August 2018) through 14.1-66.59 (November 2025). Unlisted builds remain unknown.
 
 Credit: [Fox-IT Security Research Team](https://blog.fox-it.com/2022/12/28/cve-2022-27510-cve-2022-27518-measuring-citrix-adc-gateway-version-adoption-on-the-internet/)
 
@@ -66,35 +113,50 @@ An MTIME that is absent from the lookup table also falls through to other versio
 
 ### 2. NITRO API
 
-Probes `/nitro/v1/config/nsversion` and `/nsversion`. Some appliances return the version in JSON without authentication. Includes login-page false positive filtering — if the response is an HTML login portal instead of JSON, it's correctly rejected.
+Probes `/nitro/v1/config/nsversion` and `/nsversion`. Some appliances return a version without authentication. The scanner requires a successful NITRO version response and rejects login-page or error content as a build source. An unauthenticated response can still come through a virtual host or proxy, so verify each node through its authenticated management interface.
 
 ### 3. HTTP Response Headers
 
-Scans `Server`, `X-NS-version`, `X-Citrix-Version`, `Via`, and `X-NS-Build` headers across all probed endpoints.
+Scans `Server`, `X-NS-version`, `X-Citrix-Version`, `Via`, and `X-NS-Build` headers across all probed endpoints. These are build candidates; `Via` can identify an intermediary.
 
 ### 4. Response Body Firmware Patterns
 
-Regex-scans HTML, JavaScript, and XML responses for firmware-specific strings like `NS14.1: Build 65.11`.
+Regex-scans HTML, JavaScript, and XML responses for firmware-specific strings like `NS14.1: Build 65.11`. Page text is a triage clue, not proof of the running build.
 
-### 5. EPA Binary PE Analysis
+### 5. EPA Client Inventory
 
-Downloads the Endpoint Analysis client (`nsepa_setup.exe`) and scans the PE binary for embedded NetScaler firmware version strings. Includes strict validation to reject Windows build numbers (e.g., `11.0.20348.1`) that are present in the PE metadata but represent the Windows SDK version, not NetScaler firmware.
+Detects the Endpoint Analysis client (`nsepa_setup.exe`) and, unless `--no-deep` is set, can read its PE metadata. The installer identifies a client plugin; its size or version does **not** establish the appliance firmware build and is never used for a CVE patch verdict.
 
-### 6-10. Additional Vectors
+### Additional Clues
 
-Content-Length fingerprinting, ETag correlation, login page hash mapping, TLS certificate CN/SAN analysis, and plugin version filtering (to reject VPN client versions like `25.5.x.x` that appear in `pluginlist.xml`).
+The report retains ETag hashes, stock login page hashes, TLS certificate names, and a `?v=` asset token when present. A corpus made with `firmware_corpus.py` can match a stock GZIP timestamp or token to **all** builds that share it. A corpus match is a served-resource build candidate even if only one package matches. Plugin versions like `25.5.x.x` in `pluginlist.xml` are not firmware versions. The JSON report marks external patch state as unverified and retains each version source and its confidence.
 
 ### What If Version Can't Be Determined?
 
-Some hardened appliances gate every resource path (including static files) behind authentication. When this happens, CitrixScan provides detailed diagnostics explaining exactly which paths were tried and what each returned, along with actionable guidance:
+Some hardened appliances gate resource paths (including static files) behind authentication. When this happens, CitrixScan retains bounded GZIP probe diagnostics and owner-side verification guidance:
 
 ```
 VERSION UNKNOWN: Authenticate and run 'show ns version' to confirm patch status.
+  → CVE-2026-88771 patch status is unknown. Verify the build and edition against CTX697096 immediately.
   → Fingerprint diagnostic: rdx_en.json.gz — GZIP valid but MTIME=0 (timestamp stripped)
-  → Vulnerable config detected. ASSUME VULNERABLE until version confirmed.
-  → EPA binary downloadable. Download nsepa_setup.exe and check file properties.
-  → Or use NITRO API with credentials: curl -k -u nsroot:pass https://<IP>/nitro/v1/config/nsversion
+  → Gateway or authentication features are visible; prioritize owner-side version and configuration review.
+  → Confirm the running build and edition on every node with 'show ns version' or authenticated NITRO on the management network.
 ```
+
+### Resolving uncertain patch status
+
+Treat each version signal as evidence about the **response received**, not proof that every appliance behind an address is patched. A Shodan banner is a historical observation. A live page, header, or static resource can be served by a different virtual host or a cache; a public virtual IP can front an HA pair whose nodes run different builds during an upgrade. If signals disagree, retain each value and report **unknown/conflicting** until the owner verifies the appliance. [Citrix SNI guidance](https://docs.netscaler.com/en-us/citrix-adc/current-release/ssl/config-ssloffloading.html) · [Citrix cache behavior](https://docs.netscaler.com/en-us/citrix-adc/current-release/optimization/integrated-caching/configure-cookies-headers-and-polling.html) · [Citrix HA upgrade guidance](https://docs.netscaler.com/en-us/citrix-adc/current-release/upgrade-downgrade-citrix-adc-appliance/upgrade-downgrade-HA-pair.html)
+
+| Evidence | Confidence | Appropriate use |
+|---|---|---|
+| Authenticated `show ns version` or NITRO `GET /nitro/v1/config/nsversion` on an appliance management IP | Direct | Running build of that node; check every HA or cluster node and confirm FIPS/NDcPP edition. [Citrix NITRO documentation](https://developer-docs.netscaler.com/en-us/adc-nitro-api/current-release/usecases/retrieve-firmware-licensing-information) |
+| Live GZIP timestamp from `/vpn/js/rdx/core/lang/rdx_en.json.gz` or stock asset `?v=` hash from `/vpn/index.html`, matched to a known firmware package | Build candidate | Evidence for the served resource; record path, timestamp or hash, match source, and cache headers. An unmapped value or disagreement is not a patch verdict. [Fox-IT fingerprint research](https://blog.fox-it.com/2022/12/28/cve-2022-27510-cve-2022-27518-measuring-citrix-adc-gateway-version-adoption-on-the-internet/) |
+| Successful unauthenticated NITRO version response | Served build | Useful live evidence for the responding virtual host; confirm which node answered and check all peers. |
+| Live version text in a page/header, or cached Shodan metadata | Triage lead | Keep its observation time and source; confirm the running build separately. |
+
+For authorized endpoints with no build, the optional Host/SNI follow-up can retry stock resource GETs using an explicitly approved gateway FQDN while keeping the TCP destination pinned to the approved IP:port. It also supports HTTP-only endpoints using the live scan's selected scheme. Compare the GZIP timestamp and stock `?v=` hash against a local reference corpus built from Citrix firmware packages; Fox-IT documents [extracting both values from a package](https://github.com/fox-it/citrix-netscaler-triage/blob/main/extract-Stamp-From-TgzFile.py). Keep all matching builds if a fingerprint is shared. An EPA **client** version, certificate date, or missing resource cannot establish the NetScaler firmware build.
+
+The owner can resolve remaining unknowns by checking `show ns version` on each node, using authenticated NITRO from the management network, or refreshing the NetScaler Console inventory, which [polls build versions](https://docs.netscaler.com/en-us/netscaler-application-delivery-management-software/current-release/overview/how-mas-communicates-with-managed-instances). Compare the running build and edition with the [Citrix fixed-build table](https://support.citrix.com/external/article/CTX697096/netscaler-adc-and-netscaler-gateway-secu.html). Keep credentials and appliance configuration out of public reports.
 
 ---
 
@@ -147,7 +209,16 @@ Run `python3 citrixscan.py --list-cves` for the full interactive table.
 | NetScaler ADC 13.1-FIPS and 13.1-NDcPP | 13.1-37.279 |
 
 If the scanner cannot identify the firmware build or distinguish a FIPS/NDcPP edition, verify both on the appliance with `show ns version` before deciding whether it is patched. Compare the result with the corresponding edition and branch in Citrix's bulletin.
+When the 13.1 standard and FIPS/NDcPP thresholds would give different answers for an unlabelled build, CitrixScan lists CVE-2026-88771 as unassessed until the edition is confirmed. It does not count that case as a confirmed vulnerability or a confirmed fix.
 For a known FIPS/NDcPP edition, older database entries without an edition-specific fix are listed as unassessed. The scanner does not substitute standard-release patch thresholds for those entries.
+
+### Separate NetScaler SAML advisory (October 2, 2026)
+
+Citrix issued [security update guidance for NetScaler SAML authentication deployments](https://community.citrix.com/techzone-blogs/110_security-updates/security-update-guidance-for-netscaler-saml-authentication-deployments/) separately from bulletin CTX697096 and CVE-2026-88771. No CVE identifier or fixed-build thresholds were available for this SAML guidance at the time of this update, so CitrixScan does not label a build vulnerable or patched for it.
+
+Use `--saml-config FILE` with exactly one target to screen a **local** NetScaler `ns.conf` export. The screen looks for a SAML action (`samlAction`) or SAML identity provider profile (`samlIdPProfile`) together with a Gateway or AAA virtual server. A match signals a deployment that should be reviewed against Citrix's guidance; it does not establish that the configuration is exploitable. Confirm the effective configuration and remediation on the appliance. The file is not sent to the target and its contents are not included in scanner reports. Treat the export as sensitive and follow your organization's handling rules.
+
+The external scan's SAML heuristics are separate from this local configuration screen. An absent external SAML signal cannot clear a deployment under the new guidance.
 
 ### CVE Applicability Logic
 
@@ -165,16 +236,18 @@ CVE-2025-12101 CVSS  5.1 MEDIUM               ? config unconfirmed
 
 Probes 15 paths associated with known post-exploitation activity, primarily from CVE-2023-3519 campaigns documented in [CISA Advisory AA23-201A](https://www.cisa.gov/news-events/cybersecurity-advisories/aa23-201a).
 
+These are selected external HTTP checks, not a forensic assessment or a complete IoC set for CVE-2026-88771. A path or content match requires analyst validation; a clean result does not establish that the appliance was never compromised. Patching closes a known vulnerability but does not remove an implant or undo access gained earlier. [CISA's 2026 alert](https://content.govdelivery.com/accounts/USDHSCISA/bulletins/42cc465) urges organizations to check for compromise before patching where possible and preserve evidence because updates may reduce forensic visibility. For suspected compromise, follow [Citrix's recovery guidance](https://support.citrix.com/external/article/CTX694799/steps-to-take-if-netscaler-adc-is-suspec.html) with your incident response team.
+
 ### Content-Based Analysis
 
 The scanner distinguishes between:
 
 - **Stock NetScaler files** (e.g., `newbm.pl`, `rmbm.pl`) — legitimate bookmark management scripts that ship with every Gateway install. These are not flagged.
-- **Trojaned stock files** — Stock paths containing webshell indicators (PHP eval, system calls, etc.). Flagged as CRITICAL.
-- **Non-stock webshells** — Files at IoC paths with malicious content. Flagged as CRITICAL with content preview.
+- **Stock files with suspicious content** — Stock paths containing webshell indicators (PHP eval, system calls, etc.). Flagged as CRITICAL for investigation.
+- **Unexpected files at checked paths** — Non-stock paths with suspicious content. Flagged as CRITICAL with content preview for investigation.
 - **Modified stock files** — Stock paths with unexpected content not matching legitimate signatures. Flagged as HIGH.
 
-Each finding includes a content preview (first 150 characters) so analysts can validate without manual investigation.
+Each finding includes a short content preview to help analysts triage it. Confirm suspicious files and activity through authenticated appliance and log review.
 
 ---
 
@@ -200,11 +273,11 @@ Many NetScaler appliances return the login portal HTML with `200 OK` for any una
 
 | Rating | Criteria |
 |---|---|
-| **CRITICAL** | IoC detected, EOL software, in-the-wild exploited CVE, or critical misconfiguration |
-| **HIGH** | Critical-severity CVE (no ITW), unassessed CVEs for a known FIPS/NDcPP edition, or unknown version with vulnerable config detected |
-| **MEDIUM** | High-severity CVEs, or NetScaler with unknown version |
-| **LOW** | Fully patched, no findings |
-| **INFO** | Not a NetScaler or not reachable |
+| **CRITICAL** | Critical potential IoC, EOL branch, critical CVE, known exploited applicable CVE, or critical misconfiguration |
+| **HIGH** | High-severity potential IoC, high-severity CVE, unassessed CVEs for an edition, high-severity TLS finding, or unknown version with a detectable configuration prerequisite |
+| **MEDIUM** | Medium-severity potential IoC, other applicable CVEs, or identified NetScaler with unknown version |
+| **LOW** | Identified NetScaler with a version and no modeled findings in the selected modules; this does not prove patch or compromise status |
+| **INFO** | Not identified as NetScaler or not reachable; review reachability and identification errors separately |
 
 ---
 
@@ -217,22 +290,36 @@ Many NetScaler appliances return the login portal HTML with `200 OK` for any una
 | **Markdown** | `--markdown report.md` | Executive reporting, wiki, Slack/Teams |
 | **Terminal** | (default) | Interactive use. Add `-v` for verbose. |
 
+### Automation exit codes
+
+Use `--fail-on-risk {medium,high,critical}` to alert when any target reaches the selected rating or higher. Use `--fail-on-saml-match` with `--saml-config FILE` to alert when the local configuration screen matches. Exit codes are **0** for a completed scan without selected findings, **1** for input or report errors, **2** for selected findings, **3** for an incomplete scan, and **4** when both a finding and incomplete coverage occur. Treat **2 or 4** as a finding and **3 or 4** as incomplete coverage. These flags set process status for a scheduler or SIEM collector; CitrixScan does not send messages itself. Preserve the JSON, CSV, or Markdown report for investigation.
+
 ---
 
 ## CLI Reference
 
 ```
-usage: citrixscan.py [-h] [-f FILE] [-p PORT] [-t TIMEOUT] [--threads N]
-                     [-o JSON] [--csv CSV] [--markdown MD] [-v]
-                     [--modules MODULES] [--no-deep] [--list-cves] [--version]
+usage: citrixscan.py [-h] [-f FILE] [--shodan-export FILE]
+                     [--live-shodan-export FILE] [-p PORT]
+                     [--scheme {http,https}] [--firmware-corpus FILE]
+                     [-t TIMEOUT] [--threads THREADS]
+                     [-o OUTPUT_JSON] [--csv OUTPUT_CSV]
+                     [--markdown OUTPUT_MD] [-v]
+                     [--modules MODULES] [--no-deep] [--saml-config FILE]
+                     [--fail-on-risk {medium,high,critical}]
+                     [--fail-on-saml-match] [--list-cves] [--version]
                      [targets ...]
 ```
 
 | Flag | Description | Default |
 |---|---|---|
 | `targets` | Target IPs or hostnames (space-separated) | — |
-| `-f FILE` | Target list file (one per line, `#` for comments) | — |
-| `-p PORT` | HTTPS port | 443 |
+| `-f FILE` | Live scan target list (one IP or hostname per line, `#` for comments) | — |
+| `--shodan-export FILE` | Offline triage of cached Shodan JSONL banners; no connections to listed hosts | — |
+| `--live-shodan-export FILE` | Live scan each authorized HTTP service IP:port in a Shodan JSONL export; detect HTTPS or HTTP per endpoint | — |
+| `-p PORT` | Port for ordinary live targets; live Shodan mode uses each record's port | 443 |
+| `--scheme {http,https}` | Protocol for ordinary live targets; live Shodan mode selects the protocol automatically | `https` |
+| `--firmware-corpus FILE` | Local JSON corpus of stock asset and GZIP fingerprints built from firmware packages | — |
 | `-t SEC` | Timeout per request (seconds) | 15 |
 | `--threads N` | Concurrent scan threads | 5 |
 | `-o FILE` | JSON report output path | — |
@@ -240,15 +327,20 @@ usage: citrixscan.py [-h] [-f FILE] [-p PORT] [-t TIMEOUT] [--threads N]
 | `--markdown FILE` | Markdown report output path | — |
 | `-v` | Verbose (paths, ETags, headers, TLS) | off |
 | `--modules LIST` | `all`, `cve`, `ioc`, `misconfig`, `tls`, `headers` | `all` |
-| `--no-deep` | Skip EPA binary download | off |
+| `--no-deep` | Skip EPA binary GET/download; retain HEAD/size and other version probes | off |
+| `--saml-config FILE` | Screen a local `ns.conf` for SAML action or IdP profile plus Gateway/AAA vServer; requires one target | — |
+| `--fail-on-risk LEVEL` | Set finding status if any target's risk is at least `medium`, `high`, or `critical` | — |
+| `--fail-on-saml-match` | Set finding status when `--saml-config` finds the SAML deployment pattern | off |
 | `--list-cves` | Print CVE database and exit | — |
 | `--version` | Print version and exit | — |
+
+`vhost_followup.py` has a separate CLI: `--shodan-export FILE --live-report FILE --approved-hostnames CSV --output-json FILE`, with optional `--timeout SEC` (default 5, maximum 15) and `--threads N` (default 2, maximum 4). The CSV must have exactly `ip,port,hostname` columns. It probes only approved FQDNs that also occur in the Shodan export for unresolved, reachable NetScaler endpoints in the live report; it does not issue a patch-status verdict.
 
 ---
 
 ## Architecture
 
-Single Python file (~2,100 lines), zero external dependencies, stdlib only.
+The scanner is `citrixscan.py`. Optional `firmware_corpus.py` builds a local reference corpus from firmware packages; `vhost_followup.py` and `vhost_probe.py` collect bounded Host/SNI evidence. All use the Python standard library.
 
 ### Scan Phases
 
@@ -266,9 +358,9 @@ Phase 2: Extended Probing
   └── Version pattern matching
 
 Phase 3: Deep Analysis
-  ├── EPA binary download + PE string scan
-  ├── Content-Length fingerprinting
-  └── Login page hash fingerprinting
+  ├── EPA client availability and optional binary metadata
+  ├── Stock asset and GZIP fingerprints against an optional corpus
+  └── Login page hash and ETag collection
 
 Phase 4: Security Assessment
   ├── CVE mapping (26-entry database)
@@ -287,8 +379,8 @@ Contributions welcome via pull request:
 - **GZIP timestamp mappings** — New `stamp → version` entries for the `RDX_EN_STAMP_TO_VERSION` dict
 - **CVE entries** — New CVEs following the `CVEEntry` dataclass format
 - **IoC paths** — Webshell/backdoor paths from incident response engagements
-- **EPA size mappings** — Known EPA binary sizes for the `EPA_SIZE_MAP` dict
-- **Page hash mappings** — Login page SHA256 hashes for `KNOWN_PAGE_HASHES`
+- **Firmware corpus examples** — Provenance and collision cases for stock asset or GZIP fingerprints
+- **Page hash mappings** — Login page SHA256 hashes for `KNOWN_PAGE_HASHES`, treated as build candidates
 
 ---
 
