@@ -34,6 +34,9 @@ python3 citrixscan.py 10.0.0.1 10.0.0.2 10.0.0.3 \
 # Bulk scan from file
 python3 citrixscan.py -f targets.txt --threads 10 -o results.json
 
+# Triage cached Shodan JSONL records without contacting listed hosts
+python3 citrixscan.py --shodan-export shodan.jsonl -o shodan-triage.json
+
 # List all CVEs in the database
 python3 citrixscan.py --list-cves
 
@@ -51,7 +54,17 @@ python3 citrixscan.py 10.0.0.1 --saml-config /path/to/ns.conf --fail-on-saml-mat
 
 - **Python 3.8+**
 - **No external dependencies** — stdlib only
-- Network access to target(s) on HTTPS port
+- Network access to target(s) on HTTPS port for live scans
+
+---
+
+## Offline Shodan Export Triage
+
+Use `--shodan-export FILE` with a locally saved Shodan JSONL export (one JSON object per line). This mode reads cached service banners and makes **zero connections to the listed hosts**. It does not perform the live HTTP, TLS, configuration, or IoC checks described below. Use `-o FILE` to save a sanitized JSON report; raw banners and cookies are not included in that report.
+
+The report classifies firmware version evidence as **consistent**, **conflicting**, or **unknown**. A CVE-2026-88771 **candidate** means the cached evidence warrants follow-up against [Citrix bulletin CTX697096](https://support.citrix.com/external/article/CTX697096/netscaler-adc-and-netscaler-gateway-secu.html). Shodan observations may be old, incomplete, or from a different virtual host. Cached banners cannot confirm a device's current build, edition, configuration, patch state, or compromise status. Verify candidates on appliances you are authorized to assess before notifying an owner that a vulnerability is present.
+
+`-f FILE` remains a list of live scan targets, one IP or hostname per line. Do not use `-f` for a Shodan export.
 
 ---
 
@@ -243,7 +256,8 @@ Use `--fail-on-risk {medium,high,critical}` to alert when any target reaches the
 ## CLI Reference
 
 ```
-usage: citrixscan.py [-h] [-f FILE] [-p PORT] [-t TIMEOUT] [--threads N]
+usage: citrixscan.py [-h] [-f FILE] [--shodan-export FILE]
+                     [-p PORT] [-t TIMEOUT] [--threads N]
                      [-o JSON] [--csv CSV] [--markdown MD] [-v]
                      [--modules MODULES] [--no-deep] [--saml-config FILE]
                      [--fail-on-risk {medium,high,critical}]
@@ -254,7 +268,8 @@ usage: citrixscan.py [-h] [-f FILE] [-p PORT] [-t TIMEOUT] [--threads N]
 | Flag | Description | Default |
 |---|---|---|
 | `targets` | Target IPs or hostnames (space-separated) | — |
-| `-f FILE` | Target list file (one per line, `#` for comments) | — |
+| `-f FILE` | Live scan target list (one IP or hostname per line, `#` for comments) | — |
+| `--shodan-export FILE` | Offline triage of cached Shodan JSONL banners; no connections to listed hosts | — |
 | `-p PORT` | HTTPS port | 443 |
 | `-t SEC` | Timeout per request (seconds) | 15 |
 | `--threads N` | Concurrent scan threads | 5 |

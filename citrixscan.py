@@ -47,6 +47,7 @@ __license__ = "MIT"
 import argparse
 import csv
 import hashlib
+import ipaddress
 import json
 import re
 import ssl
@@ -2320,6 +2321,198 @@ def determine_exit_code(results: list, failed_targets: list,
     return 0
 
 
+def analyze_shodan_record(record: dict) -> dict:
+    """Triage one cached Shodan service record without contacting its host."""
+    if not isinstance(record, dict):
+        raise ValueError("record is not a JSON object")
+    ip = record.get("ip_str")
+    port = record.get("port")
+    if not isinstance(ip, str) or not isinstance(port, int) or isinstance(port, bool):
+        raise ValueError("record needs an IP address and port")
+    try:
+        parsed_ip = ipaddress.ip_address(ip)
+    except ValueError as exc:
+        raise ValueError("record has an invalid IP address") from exc
+    if getattr(parsed_ip, "scope_id", None) is not None:
+        raise ValueError("record has an invalid IP address")
+    ip = str(parsed_ip)
+    if not 1 <= port <= 65535:
+        raise ValueError("record has an invalid port")
+
+    http = record.get("http") if isinstance(record.get("http"), dict) else {}
+    html = http.get("html") if isinstance(http.get("html"), str) else ""
+    raw_headers = http.get("headers") if isinstance(http.get("headers"), dict) else {}
+    headers = {
+        "-".join(part.capitalize() for part in key.split("-")): value
+        for key, value in raw_headers.items()
+        if isinstance(key, str) and isinstance(value, str)
+    }
+    response = {"headers": headers, "body": html}
+    product_responses = [response]
+    http_server = http.get("server")
+    if isinstance(http_server, str):
+        product_responses.append({"headers": {"Server": http_server}, "body": ""})
+    raw_banner = record.get("data")
+    if isinstance(raw_banner, str):
+        product_responses.append({"headers": {}, "body": raw_banner})
+    product_label = record.get("product", "")
+    product_detected = detect_product(product_responses, {}) or (
+        isinstance(product_label, str) and "netscaler" in product_label.lower()
+    )
+
+    evidence = []
+    candidate_versions = []
+    seen = set()
+
+    def add_evidence(source: str, raw: str) -> None:
+        parsed = parse_netscaler_version(raw)
+        if parsed is None:
+            return
+        edition = version_branch(parsed, raw)
+        key = (source, parsed, edition)
+        if key in seen:
+            return
+        seen.add(key)
+        entry = {"source": source, "version": format_version(parsed)}
+        base_branch = f"{parsed[0]}.{parsed[1]}"
+        if edition != base_branch:
+            entry["edition"] = edition[len(base_branch) + 1:]
+        evidence.append(entry)
+        candidate_versions.append((parsed, raw, edition))
+
+    def add_firmware_matches(source: str, text: str) -> None:
+        occupied = []
+        for pattern in FIRMWARE_PATTERNS:
+            for match in re.finditer(pattern, text, re.IGNORECASE):
+                if any(match.start() < end and match.end() > start
+                       for start, end in occupied):
+                    continue
+                occupied.append(match.span())
+                add_evidence(source, matched_firmware_version(match, text))
+
+    shodan_version = record.get("version")
+    if isinstance(shodan_version, str):
+        add_evidence("shodan_version", shodan_version)
+    for name in ("x-ns-version", "x-ns-build", "x-citrix-version", "via", "server"):
+        value = next((header_value for header_name, header_value in raw_headers.items()
+                      if isinstance(header_name, str) and header_name.lower() == name
+                      and isinstance(header_value, str)), None)
+        if value and (name != "server" or any(label in value.lower()
+                                               for label in ("netscaler", "citrix"))):
+            add_evidence(f"http_header:{name}", value)
+    add_firmware_matches("http_html", html)
+    if isinstance(raw_banner, str):
+        add_firmware_matches("raw_banner", raw_banner)
+
+    distinct_versions = {version for version, _, _ in candidate_versions}
+    explicit_editions = {
+        edition for version, _, edition in candidate_versions
+        if edition != f"{version[0]}.{version[1]}"
+    }
+    if not distinct_versions:
+        version_status = "unknown"
+    elif len(distinct_versions) > 1 or len(explicit_editions) > 1:
+        version_status = "conflict"
+    else:
+        version_status = "consistent"
+
+    cve = next(item for item in CVE_DATABASE if item.cve_id == "CVE-2026-88771")
+    assessed_versions = candidate_versions
+    if version_status == "consistent" and explicit_editions:
+        assessed_versions = [item for item in candidate_versions
+                             if item[2] in explicit_editions]
+    checks = [
+        check_cve_applicability(version, {}, cve, version_raw=raw)
+        for version, raw, _ in assessed_versions
+    ]
+    fixed_builds = {check["fixed_version"] for check in checks if check["fixed_version"]}
+    all_below = product_detected and bool(checks) and all(
+        check["vulnerable"] and not check["edition_unconfirmed"] for check in checks
+    )
+    if not product_detected:
+        assessment = "product_unverified"
+    elif version_status == "unknown":
+        assessment = "unknown_build"
+    elif version_status == "conflict":
+        assessment = "requires_verification"
+    elif any(check["edition_unconfirmed"] or not check["branch_match"] for check in checks):
+        assessment = "requires_verification"
+    elif all_below:
+        assessment = "below_fixed_candidate"
+    else:
+        assessment = "at_or_above_fixed_candidate"
+
+    timestamp = record.get("timestamp")
+    if not isinstance(timestamp, str) or not re.fullmatch(
+        r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})?",
+        timestamp,
+    ):
+        timestamp = None
+    else:
+        try:
+            datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+        except ValueError:
+            timestamp = None
+    return {
+        "ip": ip,
+        "port": port,
+        "timestamp": timestamp,
+        "product_detected": product_detected,
+        "version_evidence": evidence,
+        "version_status": version_status,
+        "cve_2026_88771": {
+            "assessment": assessment,
+            "all_candidates_below_fixed": all_below,
+            "fixed_build": next(iter(fixed_builds)) if len(fixed_builds) == 1 else None,
+            "advisory": "CTX697096",
+        },
+    }
+
+
+def analyze_shodan_export(filepath) -> dict:
+    """Read Shodan JSON Lines as untrusted cached evidence."""
+    records = []
+    errors = []
+    with open(filepath, encoding="utf-8") as source:
+        for line_number, line in enumerate(source, 1):
+            if not line.strip():
+                continue
+            try:
+                records.append(analyze_shodan_record(json.loads(line)))
+            except json.JSONDecodeError:
+                errors.append({"line": line_number, "error": "invalid JSON"})
+            except ValueError as exc:
+                errors.append({"line": line_number, "error": str(exc)})
+
+    assessments = [item["cve_2026_88771"] for item in records]
+    summary = {
+        "records": len(records),
+        "unique_hosts": len({item["ip"] for item in records}),
+        "product_candidates": sum(item["product_detected"] for item in records),
+        "version_conflicts": sum(item["version_status"] == "conflict" for item in records),
+        "conflict_hosts": len({item["ip"] for item in records
+                               if item["version_status"] == "conflict"}),
+        "unknown_builds": sum(item["version_status"] == "unknown" for item in records),
+        "unknown_build_hosts": len({item["ip"] for item in records
+                                    if item["version_status"] == "unknown"}),
+        "below_fixed_candidates": sum(item["assessment"] == "below_fixed_candidate"
+                                      for item in assessments),
+        "conflicting_below_fixed_candidates": sum(
+            item["version_status"] == "conflict"
+            and item["cve_2026_88771"]["all_candidates_below_fixed"] for item in records
+        ),
+        "invalid_records": len(errors),
+    }
+    return {
+        "mode": "offline_shodan_export",
+        "cve": "CVE-2026-88771",
+        "advisory": "CTX697096",
+        "summary": summary,
+        "records": records,
+        "errors": errors,
+    }
+
+
 class ScannerArgumentParser(argparse.ArgumentParser):
     def error(self, message):
         self.print_usage(sys.stderr)
@@ -2334,6 +2527,8 @@ def main():
     )
     parser.add_argument("targets", nargs="*", help="Target IPs or hostnames")
     parser.add_argument("-f", "--file", help="Target list file (one per line)")
+    parser.add_argument("--shodan-export", metavar="FILE",
+                        help="Triage Shodan JSON Lines offline without contacting listed hosts")
     parser.add_argument("-p", "--port", type=int, default=443, help="HTTPS port (default: 443)")
     parser.add_argument("-t", "--timeout", type=int, default=15, help="Timeout per request (default: 15s)")
     parser.add_argument("--threads", type=int, default=5, help="Concurrent threads (default: 5)")
@@ -2371,6 +2566,31 @@ def main():
             print(f"{cve.cve_id:20s} {cve.cvss:5.1f} {cve.severity:9s} {itw:4s} {poc:4s} {cve.title}")
         print(f"\n{B}Legend:{R} 🔥 = Exploited in the wild  ⚡ = Public PoC available\n")
         sys.exit(0)
+
+    if args.shodan_export:
+        if args.targets or args.file or args.saml_config or args.fail_on_saml_match:
+            parser.error("--shodan-export cannot be combined with live targets or SAML configuration")
+        if args.output_csv or args.output_md or args.fail_on_risk:
+            parser.error("--shodan-export supports JSON output only; live risk flags do not apply")
+        if args.modules not in ("all", "cve"):
+            parser.error("--shodan-export assesses cached CVE evidence only")
+        try:
+            offline_report = analyze_shodan_export(args.shodan_export)
+            if args.output_json:
+                with open(args.output_json, "w", encoding="utf-8") as output:
+                    json.dump(offline_report, output, indent=2)
+                    output.write("\n")
+        except (OSError, UnicodeError) as exc:
+            print(f"[!] Could not process Shodan export: {exc}", file=sys.stderr)
+            return 1
+        summary = offline_report["summary"]
+        print(f"Offline Shodan evidence: {summary['records']} records, "
+              f"{summary['unique_hosts']} hosts; "
+              f"{summary['version_conflicts']} version conflicts, "
+              f"{summary['unknown_builds']} unknown builds, "
+              f"{summary['invalid_records']} invalid records.")
+        print("Cached banner triage only; verify build and edition on the appliance.")
+        return 1 if summary["invalid_records"] or not summary["records"] else 0
 
     targets = list(args.targets) if args.targets else []
     if args.file:
