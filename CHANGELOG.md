@@ -2,6 +2,16 @@
 
 All notable changes to CitrixScan will be documented in this file.
 
+## 2026-10-02
+
+### Defender alerts and post-patch review
+
+- Added a local `ns.conf` screen for the separate [NetScaler SAML authentication guidance](https://community.citrix.com/techzone-blogs/110_security-updates/security-update-guidance-for-netscaler-saml-authentication-deployments/). It identifies a SAML action or IdP profile alongside a Gateway/AAA virtual server without placing configuration contents in reports; it does not assert a CVE or fixed build.
+- Added `--fail-on-risk` and `--fail-on-saml-match` for automation, with distinct finding and incomplete-scan exit codes.
+- Clarified that selected external IoC checks cannot rule out pre-patch compromise. Linked [CISA's advisory](https://content.govdelivery.com/accounts/USDHSCISA/bulletins/42cc465) and [Citrix's response steps](https://support.citrix.com/external/article/CTX694799/steps-to-take-if-netscaler-adc-is-suspec.html) for evidence preservation and investigation.
+- Corrected LOW/INFO risk descriptions and documented that `--no-deep` skips EPA binary downloads while retaining other version probes.
+- Classified edition-ambiguous 13.1 builds as unassessed, corrected stock-path and content matching in IoC checks, kept redirects on the requested HTTPS host, and marked missing HTTPS responses and failed targets as incomplete scans.
+
 ## 2026-10-01
 
 ### CVE-2026-88771

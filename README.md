@@ -1,11 +1,11 @@
 # CitrixScan
 
-**Full-scope external security scanner for Citrix NetScaler ADC and NetScaler Gateway appliances.**
+**External security scanner for Citrix NetScaler ADC and NetScaler Gateway appliances.**
 ---
 
 ## What It Does
 
-CitrixScan performs a comprehensive, non-exploitative security assessment of internet-facing Citrix NetScaler appliances. It identifies the firmware version, maps it against 26 known CVEs spanning 2019–2026, detects vulnerable configurations, checks for indicators of compromise, and audits TLS and security headers — all without authentication.
+CitrixScan performs a non-exploitative security assessment of internet-facing Citrix NetScaler appliances. It attempts to identify the firmware version, maps it against 26 known CVEs spanning 2019–2026, screens detectable configurations and selected indicators of compromise (IoCs), and audits TLS and security headers — all without appliance authentication. External results need confirmation on the appliance, especially when the version or edition is unknown.
 
 ### Scan Modules
 
@@ -13,7 +13,7 @@ CitrixScan performs a comprehensive, non-exploitative security assessment of int
 |---|---|
 | **Version Fingerprinting** | 10 detection vectors including GZIP timestamp extraction (Fox-IT technique), NITRO API probing, EPA binary PE analysis, HTTP header parsing, and static resource hashing |
 | **CVE Assessment** | 26 CVEs with version-to-fix mapping, configuration prerequisite validation, in-the-wild exploitation tracking, and public PoC status |
-| **IoC Detection** | 15 known webshell/backdoor paths from CVE-2023-3519 campaigns, CISA AA23-201A indicators, with content-based analysis that distinguishes stock NetScaler files from actual implants |
+| **IoC Detection** | 15 paths associated with webshell activity, primarily from CVE-2023-3519 campaigns and CISA AA23-201A; content checks help prioritize investigation, but cannot prove or rule out compromise |
 | **Misconfiguration Audit** | 12 paths checked for exposed management interfaces, unauthenticated NITRO API access, configuration file exposure, and diagnostic data leaks — with login-page false positive filtering |
 | **TLS Audit** | Protocol version, cipher strength, deprecated cipher detection, certificate expiry |
 | **Security Headers** | HSTS, X-Frame-Options, CSP, X-Content-Type-Options, server version disclosure |
@@ -39,6 +39,12 @@ python3 citrixscan.py --list-cves
 
 # Skip EPA binary download (faster scan)
 python3 citrixscan.py 10.0.0.1 --no-deep -v
+
+# Alert an automation when a target reaches HIGH or CRITICAL risk
+python3 citrixscan.py 10.0.0.1 --fail-on-risk high -o report.json
+
+# Screen a local ns.conf for the separate NetScaler SAML advisory
+python3 citrixscan.py 10.0.0.1 --saml-config /path/to/ns.conf --fail-on-saml-match
 ```
 
 ### Requirements
@@ -147,7 +153,16 @@ Run `python3 citrixscan.py --list-cves` for the full interactive table.
 | NetScaler ADC 13.1-FIPS and 13.1-NDcPP | 13.1-37.279 |
 
 If the scanner cannot identify the firmware build or distinguish a FIPS/NDcPP edition, verify both on the appliance with `show ns version` before deciding whether it is patched. Compare the result with the corresponding edition and branch in Citrix's bulletin.
+When the 13.1 standard and FIPS/NDcPP thresholds would give different answers for an unlabelled build, CitrixScan lists CVE-2026-88771 as unassessed until the edition is confirmed. It does not count that case as a confirmed vulnerability or a confirmed fix.
 For a known FIPS/NDcPP edition, older database entries without an edition-specific fix are listed as unassessed. The scanner does not substitute standard-release patch thresholds for those entries.
+
+### Separate NetScaler SAML advisory (October 2, 2026)
+
+Citrix issued [security update guidance for NetScaler SAML authentication deployments](https://community.citrix.com/techzone-blogs/110_security-updates/security-update-guidance-for-netscaler-saml-authentication-deployments/) separately from bulletin CTX697096 and CVE-2026-88771. No CVE identifier or fixed-build thresholds were available for this SAML guidance at the time of this update, so CitrixScan does not label a build vulnerable or patched for it.
+
+Use `--saml-config FILE` with exactly one target to screen a **local** NetScaler `ns.conf` export. The screen looks for a SAML action (`samlAction`) or SAML identity provider profile (`samlIdPProfile`) together with a Gateway or AAA virtual server. A match signals a deployment that should be reviewed against Citrix's guidance; it does not establish that the configuration is exploitable. Confirm the effective configuration and remediation on the appliance. The file is not sent to the target and its contents are not included in scanner reports. Treat the export as sensitive and follow your organization's handling rules.
+
+The external scan's SAML heuristics are separate from this local configuration screen. An absent external SAML signal cannot clear a deployment under the new guidance.
 
 ### CVE Applicability Logic
 
@@ -165,16 +180,18 @@ CVE-2025-12101 CVSS  5.1 MEDIUM               ? config unconfirmed
 
 Probes 15 paths associated with known post-exploitation activity, primarily from CVE-2023-3519 campaigns documented in [CISA Advisory AA23-201A](https://www.cisa.gov/news-events/cybersecurity-advisories/aa23-201a).
 
+These are selected external HTTP checks, not a forensic assessment or a complete IoC set for CVE-2026-88771. A path or content match requires analyst validation; a clean result does not establish that the appliance was never compromised. Patching closes a known vulnerability but does not remove an implant or undo access gained earlier. [CISA's 2026 alert](https://content.govdelivery.com/accounts/USDHSCISA/bulletins/42cc465) urges organizations to check for compromise before patching where possible and preserve evidence because updates may reduce forensic visibility. For suspected compromise, follow [Citrix's recovery guidance](https://support.citrix.com/external/article/CTX694799/steps-to-take-if-netscaler-adc-is-suspec.html) with your incident response team.
+
 ### Content-Based Analysis
 
 The scanner distinguishes between:
 
 - **Stock NetScaler files** (e.g., `newbm.pl`, `rmbm.pl`) — legitimate bookmark management scripts that ship with every Gateway install. These are not flagged.
-- **Trojaned stock files** — Stock paths containing webshell indicators (PHP eval, system calls, etc.). Flagged as CRITICAL.
-- **Non-stock webshells** — Files at IoC paths with malicious content. Flagged as CRITICAL with content preview.
+- **Stock files with suspicious content** — Stock paths containing webshell indicators (PHP eval, system calls, etc.). Flagged as CRITICAL for investigation.
+- **Unexpected files at checked paths** — Non-stock paths with suspicious content. Flagged as CRITICAL with content preview for investigation.
 - **Modified stock files** — Stock paths with unexpected content not matching legitimate signatures. Flagged as HIGH.
 
-Each finding includes a content preview (first 150 characters) so analysts can validate without manual investigation.
+Each finding includes a short content preview to help analysts triage it. Confirm suspicious files and activity through authenticated appliance and log review.
 
 ---
 
@@ -200,11 +217,11 @@ Many NetScaler appliances return the login portal HTML with `200 OK` for any una
 
 | Rating | Criteria |
 |---|---|
-| **CRITICAL** | IoC detected, EOL software, in-the-wild exploited CVE, or critical misconfiguration |
-| **HIGH** | Critical-severity CVE (no ITW), unassessed CVEs for a known FIPS/NDcPP edition, or unknown version with vulnerable config detected |
-| **MEDIUM** | High-severity CVEs, or NetScaler with unknown version |
-| **LOW** | Fully patched, no findings |
-| **INFO** | Not a NetScaler or not reachable |
+| **CRITICAL** | Critical potential IoC, EOL branch, critical CVE, known exploited applicable CVE, or critical misconfiguration |
+| **HIGH** | High-severity potential IoC, high-severity CVE, unassessed CVEs for an edition, high-severity TLS finding, or unknown version with a detectable configuration prerequisite |
+| **MEDIUM** | Medium-severity potential IoC, other applicable CVEs, or identified NetScaler with unknown version |
+| **LOW** | Identified NetScaler with a version and no modeled findings in the selected modules; this does not prove patch or compromise status |
+| **INFO** | Not identified as NetScaler or not reachable; review reachability and identification errors separately |
 
 ---
 
@@ -217,6 +234,10 @@ Many NetScaler appliances return the login portal HTML with `200 OK` for any una
 | **Markdown** | `--markdown report.md` | Executive reporting, wiki, Slack/Teams |
 | **Terminal** | (default) | Interactive use. Add `-v` for verbose. |
 
+### Automation exit codes
+
+Use `--fail-on-risk {medium,high,critical}` to alert when any target reaches the selected rating or higher. Use `--fail-on-saml-match` with `--saml-config FILE` to alert when the local configuration screen matches. Exit codes are **0** for a completed scan without selected findings, **1** for input or report errors, **2** for selected findings, **3** for an incomplete scan, and **4** when both a finding and incomplete coverage occur. Treat **2 or 4** as a finding and **3 or 4** as incomplete coverage. These flags set process status for a scheduler or SIEM collector; CitrixScan does not send messages itself. Preserve the JSON, CSV, or Markdown report for investigation.
+
 ---
 
 ## CLI Reference
@@ -224,7 +245,9 @@ Many NetScaler appliances return the login portal HTML with `200 OK` for any una
 ```
 usage: citrixscan.py [-h] [-f FILE] [-p PORT] [-t TIMEOUT] [--threads N]
                      [-o JSON] [--csv CSV] [--markdown MD] [-v]
-                     [--modules MODULES] [--no-deep] [--list-cves] [--version]
+                     [--modules MODULES] [--no-deep] [--saml-config FILE]
+                     [--fail-on-risk {medium,high,critical}]
+                     [--fail-on-saml-match] [--list-cves] [--version]
                      [targets ...]
 ```
 
@@ -240,7 +263,10 @@ usage: citrixscan.py [-h] [-f FILE] [-p PORT] [-t TIMEOUT] [--threads N]
 | `--markdown FILE` | Markdown report output path | — |
 | `-v` | Verbose (paths, ETags, headers, TLS) | off |
 | `--modules LIST` | `all`, `cve`, `ioc`, `misconfig`, `tls`, `headers` | `all` |
-| `--no-deep` | Skip EPA binary download | off |
+| `--no-deep` | Skip EPA binary GET/download; retain HEAD/size and other version probes | off |
+| `--saml-config FILE` | Screen a local `ns.conf` for SAML action or IdP profile plus Gateway/AAA vServer; requires one target | — |
+| `--fail-on-risk LEVEL` | Set finding status if any target's risk is at least `medium`, `high`, or `critical` | — |
+| `--fail-on-saml-match` | Set finding status when `--saml-config` finds the SAML deployment pattern | off |
 | `--list-cves` | Print CVE database and exit | — |
 | `--version` | Print version and exit | — |
 

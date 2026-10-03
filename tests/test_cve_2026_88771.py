@@ -23,21 +23,23 @@ from citrixscan import (
 
 
 @pytest.mark.parametrize(
-    ("version", "vulnerable", "fixed_version"),
+    ("version", "vulnerable", "fixed_version", "possible"),
     [
-        ("14.1-73.36", True, "14.1-73.37"),
-        ("14.1-73.37", False, "14.1-73.37"),
-        ("13.1-64.22", True, "13.1-64.23"),
-        ("13.1-64.23", False, "13.1-64.23"),
+        ("14.1-73.36", True, "14.1-73.37", False),
+        ("14.1-73.37", False, "14.1-73.37", False),
+        ("13.1-64.22", False, "13.1-64.23", True),
+        ("13.1-38.0", False, "13.1-64.23", True),
+        ("13.1-64.23", False, "13.1-64.23", False),
     ],
 )
-def test_cve_2026_88771_standard_build_boundary(version, vulnerable, fixed_version):
+def test_cve_2026_88771_standard_build_boundary(version, vulnerable, fixed_version, possible):
     cve = next(entry for entry in CVE_DATABASE if entry.cve_id == "CVE-2026-88771")
     parsed = parse_netscaler_version(version)
 
     result = check_cve_applicability(parsed, {}, cve)
 
     assert result["vulnerable"] is vulnerable
+    assert result["possible_vulnerability"] is possible
     assert result["fixed_version"] == fixed_version
     assert result["config_applicable"] is True
 
@@ -200,6 +202,7 @@ def test_csv_report_identifies_detected_cve(tmp_path):
         ("NS13.0: Build 92.20 FIPS", True, False),
         ("NS13.1: Build 37.278 FIPS", False, True),
         ("NS13.1: Build 37.279 FIPS", False, False),
+        ("NS13.1: Build 64.22", False, False),
     ],
 )
 def test_scan_uses_identified_edition_for_cve_and_eol(
@@ -237,6 +240,10 @@ def test_scan_uses_identified_edition_for_cve_and_eol(
                    for finding in result.cve_results)
         assert result.risk_rating == "HIGH"
         assert any("unassessed" in item.lower() for item in result.recommendations)
+    if version == "NS13.1: Build 64.22":
+        assert "CVE-2026-88771" in result.unassessed_cves
+        assert all(finding["cve_id"] != "CVE-2026-88771"
+                   for finding in result.cve_results)
 
 
 def test_official_fips_release_in_header_identifies_version(monkeypatch):

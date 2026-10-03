@@ -56,11 +56,25 @@ import sys
 import os
 import urllib.request
 import urllib.error
+from urllib.parse import urljoin, urlsplit
+import posixpath
 from datetime import datetime, timezone
 from dataclasses import dataclass, field, asdict
 from typing import Optional, List, Dict, Any, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from enum import Enum
+
+
+SAML_SECURITY_NOTICE = {
+    "id": "CITRIX-SAML-2026-10-02",
+    "title": "Citrix NetScaler SAML authentication security notice",
+    "published": "2026-10-02",
+    "source": "https://community.citrix.com/techzone-blogs/110_security-updates/security-update-guidance-for-netscaler-saml-authentication-deployments/",
+    "status": "No CVE or fixed build published in the October 2 notice",
+    "scope": "Customer-managed NetScaler using SAML with Gateway or AAA",
+    "relationship": "Independent of CTX697096 and CVE-2026-88771 through CVE-2026-88778",
+    "action": "Inspect the local configuration for SAML actions or IdP profiles and Gateway/AAA virtual servers; follow Citrix updates and contact Citrix Support if experiencing impact.",
+}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -497,6 +511,7 @@ def check_cve_applicability(ver: tuple, config_flags: dict, cve: CVEEntry,
         "branch_match": False,
         "fixed_version": None,
         "edition_unconfirmed": False,
+        "possible_vulnerability": False,
     }
     if branch != base_branch and branch not in cve.fixed_versions:
         # A standard-release fix is not evidence of the FIPS/NDcPP fix build.
@@ -516,8 +531,14 @@ def check_cve_applicability(ver: tuple, config_flags: dict, cve: CVEEntry,
                 if alt_branch.startswith(f"{base_branch}-")
             )
             result["edition_unconfirmed"] = any(
-                (ver < fixed) != (ver < alt_fix) for alt_fix in alternate_fixes
+                (ver < fixed) != (ver < alt_fix)
+                for alt_fix in alternate_fixes
             )
+            if result["edition_unconfirmed"]:
+                # The same numeric build can be patched in one edition and
+                # unpatched in another. Do not count it as a confirmed CVE.
+                result["possible_vulnerability"] = True
+                result["vulnerable"] = False
     elif branch in EOL_BRANCHES and cve.assume_eol_affected:
         # EOL branches — check if any fixed version exists for older branches
         for fb in cve.fixed_versions:
@@ -635,6 +656,18 @@ def audit_tls(tls_info: dict) -> List[dict]:
     return findings
 
 
+class TargetRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Allow redirects only to the same HTTPS host and port."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        old = urlsplit(req.full_url)
+        new = urlsplit(urljoin(req.full_url, newurl))
+        if (new.scheme != "https" or (new.hostname or "").lower() !=
+                (old.hostname or "").lower() or (new.port or 443) != (old.port or 443)):
+            return None
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
 def http_get(host, port, path, ctx, timeout=15, method="GET", max_body=8192):
     url = f"https://{host}:{port}{path}"
     req = urllib.request.Request(url, method=method, headers={
@@ -644,11 +677,12 @@ def http_get(host, port, path, ctx, timeout=15, method="GET", max_body=8192):
     })
     try:
         handler = urllib.request.HTTPSHandler(context=ctx)
-        opener = urllib.request.build_opener(handler)
+        opener = urllib.request.build_opener(handler, TargetRedirectHandler())
         resp = opener.open(req, timeout=timeout)
         headers = dict(resp.headers)
         body = resp.read(max_body).decode("utf-8", errors="replace") if method == "GET" else ""
-        return {"status": resp.status, "headers": headers, "body": body, "url": url}
+        return {"status": resp.status, "headers": headers, "body": body,
+                "url": url, "final_url": resp.geturl()}
     except urllib.error.HTTPError as e:
         headers = dict(e.headers) if e.headers else {}
         body = ""
@@ -656,7 +690,8 @@ def http_get(host, port, path, ctx, timeout=15, method="GET", max_body=8192):
             body = e.read(4096).decode("utf-8", errors="replace")
         except Exception:
             pass
-        return {"status": e.code, "headers": headers, "body": body, "url": url}
+        return {"status": e.code, "headers": headers, "body": body,
+                "url": url, "final_url": e.geturl()}
     except Exception:
         return None
 
@@ -669,7 +704,7 @@ def http_get_binary(host, port, path, ctx, timeout=30, max_bytes=20*1024*1024):
     })
     try:
         handler = urllib.request.HTTPSHandler(context=ctx)
-        opener = urllib.request.build_opener(handler)
+        opener = urllib.request.build_opener(handler, TargetRedirectHandler())
         resp = opener.open(req, timeout=timeout)
         data = resp.read(max_bytes)
         return {"status": resp.status, "headers": dict(resp.headers), "data": data, "size": len(data)}
@@ -921,6 +956,7 @@ class ScanResult:
     ip: str
     port: int
     timestamp: str
+    modules_run: str = "all"
     reachable: bool = False
     is_netscaler: bool = False
     version_raw: str = ""
@@ -943,6 +979,8 @@ class ScanResult:
     # Config detection
     saml_idp_detected: bool = False
     saml_sp_detected: bool = False
+    saml_advisory_status: str = "not_assessed"
+    saml_advisory_signals: list = field(default_factory=list)
     oauth_idp_detected: bool = False
     gateway_detected: bool = False
     aaa_detected: bool = False
@@ -996,6 +1034,35 @@ def detect_product(responses: list, tls_info: dict) -> bool:
     if any(kw in tls_combined for kw in ["netscaler", "citrix", "ns."]):
         signals += 1
     return signals >= 2
+
+
+def review_saml_config(config_text: str) -> dict:
+    """Screen a local ns.conf for Citrix's October 2 SAML notice patterns.
+
+    A pattern match calls for administrator review; it does not establish
+    exploitability or compromise. Only signal names, never config text, are
+    returned for inclusion in scan reports.
+    """
+    lines = [line for line in config_text.splitlines()
+             if line.strip() and not line.lstrip().startswith("#")]
+    config = "\n".join(lines)
+    patterns = {
+        "samlAction": r"^\s*add\s+authentication\s+samlAction\b",
+        "samlIdPProfile": r"^\s*add\s+authentication\s+samlIdPProfile\b",
+        "Gateway vserver": r"^\s*add\s+vpn\s+vserver\b",
+        "AAA vserver": r"^\s*add\s+authentication\s+vserver\b",
+    }
+    signals = [name for name, pattern in patterns.items()
+               if re.search(pattern, config, re.IGNORECASE | re.MULTILINE)]
+    has_saml = "samlAction" in signals or "samlIdPProfile" in signals
+    has_gateway_aaa = "Gateway vserver" in signals or "AAA vserver" in signals
+    if has_saml and has_gateway_aaa:
+        status = "configuration_match"
+    elif has_saml:
+        status = "saml_configuration_only"
+    else:
+        status = "no_pattern_found"
+    return {"status": status, "signals": signals}
 
 
 def detect_config(responses: list, paths_tried: dict) -> dict:
@@ -1158,7 +1225,8 @@ RDX_EN_STAMP_TO_VERSION = {
 }
 
 
-def extract_version(responses, extended_responses, paths_tried, ctx, host, port, timeout) -> Tuple[str, str, str, str]:
+def extract_version(responses, extended_responses, paths_tried, ctx, host, port, timeout,
+                    allow_epa_download=True) -> Tuple[str, str, str, str]:
     """Multi-vector version extraction. Returns (raw, source, confidence, diagnostic).
 
     Priority order:
@@ -1298,7 +1366,7 @@ def extract_version(responses, extended_responses, paths_tried, ctx, host, port,
                     return (ver_str, f"EPA Content-Length fingerprint ({size} bytes)", "MEDIUM", diagnostic)
 
             # 4b. PE binary deep scan — download and search for firmware strings
-            if 0 < size <= 20 * 1024 * 1024:
+            if allow_epa_download and 0 < size <= 20 * 1024 * 1024:
                 bin_resp = http_get_binary(host, port, epa_path, ctx, timeout)
                 if bin_resp and bin_resp["status"] == 200 and bin_resp["data"]:
                     epa_ver = extract_pe_version(bin_resp["data"])
@@ -1362,15 +1430,16 @@ STOCK_NETSCALER_FILES = {
     "/vpns/portal/scripts/ns_gui.pl",    # Portal GUI script
 }
 
-# Webshell indicators in file content
+# Strong indicators can identify suspicious content on their own. Generic
+# process calls need corroboration because legitimate stock scripts use them.
 WEBSHELL_INDICATORS = [
-    "<?php", "eval(", "base64_decode(", "system(", "exec(",
-    "passthru(", "shell_exec(", "popen(", "proc_open(",
-    "assert(", "preg_replace.*e", "create_function(",
-    "#!/usr/bin/perl", "#!/bin/sh", "#!/bin/bash",
-    "`$_", "$_GET", "$_POST", "$_REQUEST", "$_FILES",
-    "cmd.exe", "/bin/sh -c", "wget ", "curl ",
-    "nc -e", "reverse", "bind_shell", "backdoor",
+    "<?php", "base64_decode(", "passthru(", "shell_exec(",
+    "$_get", "$_post", "$_request", "$_files",
+    "#!/bin/sh", "#!/bin/bash", "/bin/sh -c", "nc -e",
+]
+WEBSHELL_SUPPORTING_INDICATORS = [
+    "eval(", "system(", "exec(", "popen(", "proc_open(",
+    "assert(", "create_function(", "wget ", "curl ",
 ]
 
 # Legitimate NetScaler content signatures (used to confirm stock files)
@@ -1391,9 +1460,19 @@ def check_iocs(host, port, ctx, timeout) -> list:
     """
     findings = []
     for path in IOC_PATHS:
-        resp = http_get(host, port, path, ctx, timeout)
+        resp = http_get(host, port, path, ctx, timeout, max_body=65536)
         if not resp or resp["status"] != 200:
             continue
+
+        # Redirected login pages and other hosts are not evidence that the
+        # requested appliance path exists.
+        final_url = resp.get("final_url")
+        if final_url:
+            final = urlsplit(final_url)
+            if (final.hostname or "").lower() != host.lower() or (final.port or 443) != port:
+                continue
+            if posixpath.normpath(final.path) != posixpath.normpath(path):
+                continue
 
         body_raw = resp.get("body", "")
         body = body_raw.lower()
@@ -1403,15 +1482,18 @@ def check_iocs(host, port, ctx, timeout) -> list:
         if body_len < 10:
             continue
 
-        # Skip if it's just a login page redirect
-        if any(skip in body for skip in ["<html", "login", "logon", "<!doctype"]):
-            if not any(ind in body for ind in WEBSHELL_INDICATORS):
-                continue
+        strong_match = any(ind in body for ind in WEBSHELL_INDICATORS)
+        if is_login_page(body_raw) and not strong_match:
+            continue
 
         # Check if this is a known stock NetScaler file
-        is_stock_path = path in STOCK_NETSCALER_FILES
+        is_stock_path = posixpath.normpath(path) in STOCK_NETSCALER_FILES
         has_stock_content = any(sig in body for sig in STOCK_CONTENT_SIGNATURES)
-        has_webshell_code = any(ind in body for ind in WEBSHELL_INDICATORS)
+        supporting_matches = sum(ind in body for ind in WEBSHELL_SUPPORTING_INDICATORS)
+        legacy_preg_replace = bool(re.search(
+            r"preg_replace\s*\(\s*['\"][^'\"]*/[a-z]*e", body
+        ))
+        has_webshell_code = strong_match or supporting_matches >= 2 or legacy_preg_replace
 
         # Content preview (first 200 chars, sanitized)
         preview = body_raw[:200].replace("\n", " ").replace("\r", "").strip()
@@ -1424,7 +1506,7 @@ def check_iocs(host, port, ctx, timeout) -> list:
                 findings.append({
                     "severity": "CRITICAL",
                     "path": path,
-                    "detail": f"POTENTIALLY TROJANED stock file at {path} — contains webshell indicators.",
+                    "detail": f"POSSIBLY TROJANED stock file at {path} — contains suspicious code indicators. Validate on the appliance.",
                     "type": "trojaned_stock_file",
                     "content_preview": preview,
                     "content_size": body_len,
@@ -1434,7 +1516,7 @@ def check_iocs(host, port, ctx, timeout) -> list:
                 findings.append({
                     "severity": "CRITICAL",
                     "path": path,
-                    "detail": f"WEBSHELL DETECTED at {path}. Investigate immediately.",
+                    "detail": f"POSSIBLE WEBSHELL at {path}. Validate on the appliance and investigate immediately.",
                     "type": "webshell",
                     "content_preview": preview,
                     "content_size": body_len,
@@ -1595,7 +1677,7 @@ def check_misconfigs(host, port, ctx, timeout, paths_tried) -> list:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def calculate_risk(result: ScanResult) -> str:
-    if result.ioc_findings:
+    if any(f.get("severity") == "CRITICAL" for f in result.ioc_findings):
         return "CRITICAL"
     if result.eol:
         return "CRITICAL"
@@ -1607,6 +1689,8 @@ def calculate_risk(result: ScanResult) -> str:
         return "CRITICAL"
     if result.high_cves > 0:
         return "HIGH"
+    if any(f.get("severity") == "HIGH" for f in result.ioc_findings):
+        return "HIGH"
     if result.unassessed_cves:
         return "HIGH"
     if result.is_netscaler and not result.version_raw:
@@ -1617,6 +1701,8 @@ def calculate_risk(result: ScanResult) -> str:
         return "HIGH"
     if result.total_vulns > 0:
         return "MEDIUM"
+    if result.ioc_findings:
+        return "MEDIUM"
     if result.is_netscaler and result.version_raw:
         return "LOW"
     return "INFO"
@@ -1625,10 +1711,22 @@ def calculate_risk(result: ScanResult) -> str:
 def build_recommendations(result: ScanResult) -> list:
     recs = []
     if result.ioc_findings:
-        recs.append("🚨 COMPROMISE INDICATORS DETECTED. Initiate incident response immediately.")
-        recs.append("  → Isolate affected appliance from network.")
-        recs.append("  → Preserve forensic evidence (snapshot, memory dump, logs).")
-        recs.append("  → Engage DFIR team. Do NOT simply patch — full investigation required.")
+        recs.append("SUSPICIOUS PATH CONTENT: Validate these potential IoCs on the appliance and initiate incident response if confirmed.")
+        recs.append("  → If confirmed, isolate the affected appliance and engage incident response.")
+        recs.append("  → Preserve forensic evidence (snapshot, memory dump, logs) before remediation when compromise is suspected.")
+        recs.append("  → Do not rely on patching alone to remove established access.")
+    if result.is_netscaler or result.saml_advisory_status != "not_assessed":
+        recs.append("SAML NOTICE (2026-10-02): Citrix reports a separate SAML authentication issue, independent of CTX697096. No CVE or fixed build is published in this notice.")
+        if result.saml_advisory_status == "configuration_match":
+            recs.append("  → Local configuration matches SAML plus Gateway/AAA screening patterns. Verify active bindings and follow Citrix's update guidance.")
+        elif result.saml_advisory_status == "saml_configuration_only":
+            recs.append("  → Local SAML pattern found; verify whether Gateway or AAA uses it.")
+        elif result.saml_advisory_status == "no_pattern_found":
+            recs.append("  → No SAML action or IdP profile pattern found in the supplied file. Confirm the file is complete and current.")
+        else:
+            recs.append("  → Inspect the local NetScaler configuration for 'add authentication samlAction' or 'add authentication samlIdPProfile' and Gateway/AAA use; an external scan cannot confirm this.")
+        recs.append(f"  → Citrix guidance: {SAML_SECURITY_NOTICE['source']}")
+        recs.append("POST-PATCH: A fixed build does not establish that the appliance was never compromised. Review NetScaler Console IoCs, logs, configuration changes, sessions, and credentials; preserve evidence if compromise is suspected.")
     if result.eol:
         recs.append(f"URGENT: Branch {result.branch} is End-of-Life. Upgrade to 14.1-73.37+ immediately.")
     if result.exploited_itw_vulns > 0:
@@ -1686,13 +1784,17 @@ def build_recommendations(result: ScanResult) -> list:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def scan_target(target: str, port: int = 443, timeout: int = 15,
-                modules: str = "all", deep_scan: bool = True) -> ScanResult:
+                modules: str = "all", deep_scan: bool = True,
+                saml_review: Optional[dict] = None) -> ScanResult:
     """Full-scope security scan of a single target."""
     start_time = datetime.now(timezone.utc)
     result = ScanResult(
         target=target, ip=target, port=port,
-        timestamp=start_time.isoformat(),
+        timestamp=start_time.isoformat(), modules_run=modules,
     )
+    if saml_review:
+        result.saml_advisory_status = saml_review["status"]
+        result.saml_advisory_signals = saml_review["signals"]
     ctx = create_ssl_context()
 
     # ── DNS ──
@@ -1743,6 +1845,8 @@ def scan_target(target: str, port: int = 443, timeout: int = 15,
     responses.append(root_resp)
     if root_resp:
         result.accessible_paths.append(f"/ [{root_resp['status']}]")
+    if not any(resp is not None for resp in responses):
+        result.errors.append("No HTTPS response received; product identification and vulnerability assessment are incomplete.")
 
     # Product detection
     result.is_netscaler = detect_product(responses, tls_info)
@@ -1781,7 +1885,8 @@ def scan_target(target: str, port: int = 443, timeout: int = 15,
 
     # Version extraction
     ver_raw, ver_src, ver_conf, ver_diag = extract_version(
-        responses, extended_responses, paths_tried, ctx, target, port, timeout
+        responses, extended_responses, paths_tried, ctx, target, port, timeout,
+        allow_epa_download=deep_scan
     )
     result.version_raw = ver_raw
     result.version_source = ver_src
@@ -1813,7 +1918,9 @@ def scan_target(target: str, port: int = 443, timeout: int = 15,
             for cve in CVE_DATABASE:
                 res = check_cve_applicability(result.version_parsed, config, cve,
                                               version_raw=result.version_raw)
-                if res["edition_unconfirmed"] and not res["branch_match"]:
+                if res["edition_unconfirmed"] and (
+                    not res["branch_match"] or res["possible_vulnerability"]
+                ):
                     result.unassessed_cves.append(cve.cve_id)
                 res["cvss"] = cve.cvss
                 res["severity"] = cve.severity
@@ -1873,9 +1980,16 @@ def print_result(r: ScanResult, verbose: bool = False):
 
     if not r.is_netscaler:
         print(f"  {B}Risk: {c}{r.risk_rating}{R}")
+        if r.saml_advisory_status != "not_assessed":
+            print(f"  Local October 2 SAML review: {r.saml_advisory_status} (remote product identification unverified)")
+            if r.saml_advisory_signals:
+                print(f"  Local config signals: {', '.join(r.saml_advisory_signals)}")
         if r.recommendations:
             for rec in r.recommendations:
                 print(f"    {rec}")
+        if r.errors:
+            for error in r.errors:
+                print(f"  Scan incomplete: {error}")
         return
 
     print(f"  Version    : {r.version_display or 'UNKNOWN'}", end="")
@@ -1898,6 +2012,9 @@ def print_result(r: ScanResult, verbose: bool = False):
     for label, val in flags:
         color = "\033[91m" if val and label in ("Mgmt Exposed",) else ("\033[93m" if val else "\033[92m")
         print(f"    {label:16s}: {color}{'DETECTED' if val else 'No'}{R}")
+    print(f"    Oct 2 SAML notice: {r.saml_advisory_status}")
+    if r.saml_advisory_signals:
+        print(f"    Local config signals: {', '.join(r.saml_advisory_signals)}")
 
     # TLS
     if r.tls_findings and verbose:
@@ -1925,17 +2042,19 @@ def print_result(r: ScanResult, verbose: bool = False):
                   f"{cv['title'][:45]}{cfg}{itw}{poc}{conf_met}")
             if cv.get("fixed_version"):
                 print(f"      → Fix: {cv['fixed_version']}  ({cv.get('advisory','')})")
-    elif r.version_parsed:
+    elif r.version_parsed and (r.modules_run == "all" or "cve" in r.modules_run):
         if r.unassessed_cves:
             print(f"\n  {B}Vulnerabilities:{R} None confirmed; {len(r.unassessed_cves)} CVE(s) unassessed for {r.branch}")
         else:
-            print(f"\n  {B}Vulnerabilities:{R} \033[92mNone found for {r.version_display}{R}")
+            print(f"\n  {B}Vulnerabilities:{R} \033[92mNo modeled CVEs found for {r.version_display}{R}")
+    elif r.version_parsed:
+        print(f"\n  {B}Vulnerabilities:{R} CVE module not run")
     if r.unassessed_cves:
         print(f"  Unassessed CVEs: {', '.join(r.unassessed_cves)}")
 
     # IoCs
     if r.ioc_findings:
-        print(f"\n  {B}\033[91m⚠ INDICATORS OF COMPROMISE ({len(r.ioc_findings)}):{R}")
+        print(f"\n  {B}\033[91m⚠ POTENTIAL INDICATORS OF COMPROMISE ({len(r.ioc_findings)}):{R}")
         for ioc in r.ioc_findings:
             sev_c = COLORS.get(ioc['severity'], "")
             print(f"    [{sev_c}{ioc['severity']:8s}{R}] {ioc['detail']}")
@@ -1977,7 +2096,8 @@ def print_result(r: ScanResult, verbose: bool = False):
     print()
 
 
-def print_summary(results: list):
+def print_summary(results: list, failed_targets=None, requested_targets=None):
+    failed_targets = failed_targets or []
     total = len(results)
     reachable = sum(1 for r in results if r.reachable)
     ns = sum(1 for r in results if r.is_netscaler)
@@ -1996,6 +2116,9 @@ def print_summary(results: list):
     print(f"{B} EXECUTIVE SUMMARY{R}")
     print(f"{'═'*80}")
     print(f"  Targets Scanned    : {total}")
+    if requested_targets is not None:
+        print(f"  Targets Requested  : {requested_targets}")
+    print(f"  Failed Targets     : {len(failed_targets) + sum(bool(r.errors) for r in results)}")
     print(f"  Reachable          : {reachable}")
     print(f"  NetScaler Detected : {ns}")
     print(f"  Version Identified : {ver}")
@@ -2010,13 +2133,15 @@ def print_summary(results: list):
     print(f"  IoC Detections     : {ioc}")
 
     if ioc > 0:
-        print(f"\n  {B}\033[91m⚠  COMPROMISE INDICATORS FOUND — INITIATE INCIDENT RESPONSE{R}")
+        print(f"\n  {B}\033[91m⚠  POTENTIAL COMPROMISE INDICATORS FOUND — VALIDATE FINDINGS{R}")
     if crit > 0:
         print(f"  {B}\033[91m⚠  CRITICAL FINDINGS REQUIRE IMMEDIATE ACTION{R}")
     print()
 
 
-def export_json(results: list, filepath: str):
+def export_json(results: list, filepath: str, modules="all", failed_targets=None,
+                requested_targets=None, saml_review=None):
+    failed_targets = failed_targets or []
     export = []
     for r in results:
         d = asdict(r)
@@ -2028,11 +2153,16 @@ def export_json(results: list, filepath: str):
                 "tool": "CitrixScan", "version": __version__, "author": __author__,
                 "scan_date": datetime.now(timezone.utc).isoformat(),
                 "cve_database_size": len(CVE_DATABASE),
-                "modules": "version, cve, ioc, misconfig, tls, headers",
+                "modules": modules,
+                "requested_targets": requested_targets if requested_targets is not None else len(results),
+                "failed_targets": failed_targets,
+                "local_saml_review": saml_review,
             },
+            "security_notice": SAML_SECURITY_NOTICE,
             "results": export,
             "summary": {
                 "total": len(results),
+                "failed_targets": len(failed_targets) + sum(bool(r.errors) for r in results),
                 "netscaler": sum(1 for r in results if r.is_netscaler),
                 "critical": sum(1 for r in results if r.risk_rating == "CRITICAL"),
                 "high": sum(1 for r in results if r.risk_rating == "HIGH"),
@@ -2045,11 +2175,13 @@ def export_json(results: list, filepath: str):
     print(f"[+] JSON: {filepath}")
 
 
-def export_csv(results: list, filepath: str):
+def export_csv(results: list, filepath: str, failed_targets=None, saml_review=None):
+    failed_targets = failed_targets or []
     fields = [
-        "target", "ip", "port", "reachable", "is_netscaler", "version_display",
+        "target", "scan_status", "errors", "ip", "port", "modules_run", "reachable", "is_netscaler", "version_display",
         "branch", "eol", "version_source", "version_confidence",
         "saml_idp_detected", "oauth_idp_detected", "gateway_detected", "aaa_detected", "mgmt_exposed",
+        "saml_advisory_status", "saml_advisory_signals",
         "tls_protocol", "tls_cipher", "tls_bits",
         "total_vulns", "critical_cves", "high_cves", "exploited_itw_vulns", "cve_ids", "unassessed_cve_ids",
         "ioc_count", "misconfig_count", "risk_rating", "recommendations",
@@ -2059,28 +2191,49 @@ def export_csv(results: list, filepath: str):
         w.writeheader()
         for r in results:
             row = {k: getattr(r, k, "") for k in fields}
+            row["scan_status"] = "incomplete" if r.errors else "complete"
+            row["errors"] = " | ".join(r.errors)
             row["ioc_count"] = len(r.ioc_findings)
             row["misconfig_count"] = len(r.misconfig_findings)
             row["cve_ids"] = ", ".join(
                 c["cve_id"] for c in r.cve_results if c.get("vulnerable")
             )
             row["unassessed_cve_ids"] = ", ".join(r.unassessed_cves)
+            row["saml_advisory_signals"] = ", ".join(r.saml_advisory_signals)
             row["recommendations"] = " | ".join(r.recommendations)
             w.writerow(row)
+        for target in failed_targets:
+            w.writerow({"target": target, "scan_status": "error",
+                        "errors": "Scanner exception; see terminal output",
+                        "saml_advisory_status": saml_review["status"] if saml_review else "not_assessed",
+                        "saml_advisory_signals": ", ".join(saml_review["signals"]) if saml_review else ""})
     print(f"[+] CSV: {filepath}")
 
 
-def export_markdown(results: list, filepath: str):
+def export_markdown(results: list, filepath: str, failed_targets=None,
+                    requested_targets=None, saml_review=None):
+    failed_targets = failed_targets or []
     with open(filepath, "w", encoding="utf-8") as f:
         f.write(f"# CitrixScan Report\n\n")
         f.write(f"**Generated:** {datetime.now(timezone.utc).isoformat()}  \n")
         f.write(f"**Tool:** CitrixScan v{__version__} by {__author__}  \n")
         f.write(f"**Targets:** {len(results)}  \n\n")
+        f.write("## Current Citrix notice\n\n")
+        f.write(f"**{SAML_SECURITY_NOTICE['title']}** ({SAML_SECURITY_NOTICE['published']}): "
+                f"{SAML_SECURITY_NOTICE['relationship']}. "
+                f"{SAML_SECURITY_NOTICE['status']}. "
+                f"[Citrix guidance]({SAML_SECURITY_NOTICE['source']}).\n\n")
+        if saml_review:
+            f.write(f"**Local SAML configuration review:** {saml_review['status']} "
+                    f"({', '.join(saml_review['signals']) or 'no screening patterns found'}).\n\n")
 
         # Summary table
         f.write("## Summary\n\n")
         f.write("| Metric | Count |\n|---|---|\n")
         f.write(f"| Targets Scanned | {len(results)} |\n")
+        if requested_targets is not None:
+            f.write(f"| Targets Requested | {requested_targets} |\n")
+        f.write(f"| Failed Targets | {len(failed_targets) + sum(bool(r.errors) for r in results)} |\n")
         f.write(f"| NetScaler Detected | {sum(1 for r in results if r.is_netscaler)} |\n")
         f.write(f"| CRITICAL | {sum(1 for r in results if r.risk_rating == 'CRITICAL')} |\n")
         f.write(f"| HIGH | {sum(1 for r in results if r.risk_rating == 'HIGH')} |\n")
@@ -2088,6 +2241,8 @@ def export_markdown(results: list, filepath: str):
         f.write(f"| Unassessed CVEs | {sum(len(r.unassessed_cves) for r in results)} |\n")
         f.write(f"| Targets with Unassessed CVEs | {sum(1 for r in results if r.unassessed_cves)} |\n")
         f.write(f"| IoC Detections | {sum(len(r.ioc_findings) for r in results)} |\n\n")
+        if failed_targets:
+            f.write("**Targets with scanner errors:** " + ", ".join(failed_targets) + "\n\n")
 
         # Per-target details
         f.write("## Findings\n\n")
@@ -2098,9 +2253,13 @@ def export_markdown(results: list, filepath: str):
             f.write(f"- **Version:** {r.version_display or 'Unknown'}\n")
             f.write(f"- **Branch:** {r.branch or 'N/A'} {'(EOL)' if r.eol else ''}\n")
             f.write(f"- **SAML IDP:** {'Yes' if r.saml_idp_detected else 'No'}\n")
+            f.write(f"- **October 2 SAML review:** {r.saml_advisory_status}\n")
             f.write(f"- **OAuth IdP:** {'Yes' if r.oauth_idp_detected else 'No'}\n")
             f.write(f"- **Gateway:** {'Yes' if r.gateway_detected else 'No'}\n")
-            f.write(f"- **CVEs:** {r.total_vulns} ({r.critical_cves} critical, {r.exploited_itw_vulns} exploited-ITW)\n\n")
+            if r.modules_run == "all" or "cve" in r.modules_run:
+                f.write(f"- **CVEs:** {r.total_vulns} ({r.critical_cves} critical, {r.exploited_itw_vulns} exploited-ITW)\n\n")
+            else:
+                f.write("- **CVEs:** Not assessed (CVE module not run)\n\n")
             if r.unassessed_cves:
                 f.write(f"- **Unassessed CVEs for this edition:** {', '.join(r.unassessed_cves)}\n\n")
 
@@ -2135,9 +2294,41 @@ BANNER = f"""
 """
 
 
+def determine_exit_code(results: list, failed_targets: list,
+                        fail_on_risk: Optional[str] = None,
+                        fail_on_saml_match: bool = False,
+                        saml_review=None) -> int:
+    """Return 2 for findings, 3 for incomplete scans, 4 for both, or 0."""
+    incomplete = bool(failed_targets) or any(r.errors for r in results)
+    risk_levels = {"MEDIUM": 1, "HIGH": 2, "CRITICAL": 3}
+    finding = False
+    if fail_on_risk:
+        threshold = risk_levels[fail_on_risk.upper()]
+        if any(risk_levels.get(r.risk_rating, 0) >= threshold for r in results):
+            finding = True
+    if fail_on_saml_match and (
+        (saml_review and saml_review["status"] == "configuration_match") or
+        any(r.saml_advisory_status == "configuration_match" for r in results)
+    ):
+        finding = True
+    if incomplete and finding:
+        return 4
+    if incomplete:
+        return 3
+    if finding:
+        return 2
+    return 0
+
+
+class ScannerArgumentParser(argparse.ArgumentParser):
+    def error(self, message):
+        self.print_usage(sys.stderr)
+        self.exit(1, f"{self.prog}: error: {message}\n")
+
+
 def main():
-    parser = argparse.ArgumentParser(
-        description="CitrixScan - Full-Scope NetScaler Security Scanner",
+    parser = ScannerArgumentParser(
+        description="CitrixScan - NetScaler Security Scanner",
         epilog="Non-exploitative. Production-safe. Authorized use only.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -2153,10 +2344,22 @@ def main():
     parser.add_argument("--modules", default="all",
                         help="Scan modules: all, cve, ioc, misconfig, tls, headers (comma-separated)")
     parser.add_argument("--no-deep", action="store_true", help="Skip EPA binary download")
+    parser.add_argument("--saml-config", metavar="FILE",
+                        help="Screen a local NetScaler configuration for the Oct 2 SAML notice (one target only)")
+    parser.add_argument("--fail-on-risk", choices=("medium", "high", "critical"),
+                        help="Set finding status when a target meets or exceeds this risk")
+    parser.add_argument("--fail-on-saml-match", action="store_true",
+                        help="Set finding status when --saml-config matches SAML and Gateway/AAA patterns")
     parser.add_argument("--list-cves", action="store_true", help="List all CVEs in database and exit")
     parser.add_argument("--version", action="version", version=f"CitrixScan v{__version__}")
 
     args = parser.parse_args()
+    selected_modules = [name.strip().lower() for name in args.modules.split(",")]
+    allowed_modules = {"all", "cve", "ioc", "misconfig", "tls", "headers"}
+    if (not selected_modules or any(name not in allowed_modules for name in selected_modules)
+            or ("all" in selected_modules and len(selected_modules) > 1)):
+        parser.error("--modules must be 'all' or a comma-separated list of cve,ioc,misconfig,tls,headers")
+    args.modules = ",".join(dict.fromkeys(selected_modules))
 
     if args.list_cves:
         print(f"\n{B}CitrixScan CVE Database ({len(CVE_DATABASE)} entries):{R}\n")
@@ -2187,17 +2390,33 @@ def main():
         sys.exit(1)
 
     targets = list(dict.fromkeys(targets))
+    if args.saml_config and len(targets) != 1:
+        parser.error("--saml-config requires exactly one target")
+    if args.fail_on_saml_match and not args.saml_config:
+        parser.error("--fail-on-saml-match requires --saml-config")
+    saml_review = None
+    if args.saml_config:
+        try:
+            with open(args.saml_config, encoding="utf-8", errors="replace") as config_file:
+                saml_review = review_saml_config(config_file.read())
+        except OSError as e:
+            print(f"[!] Could not read SAML config: {e}", file=sys.stderr)
+            return 1
 
     print(BANNER)
     print(f"  Targets: {len(targets)} │ Port: {args.port} │ Threads: {args.threads}")
     print(f"  Modules: {args.modules} │ CVE DB: {len(CVE_DATABASE)} entries")
+    if saml_review:
+        print(f"  Local SAML configuration review: {saml_review['status']}")
     print(f"  Started: {datetime.now(timezone.utc).isoformat()}")
     print(f"{'─'*80}")
 
     results = []
+    failed_targets = []
     with ThreadPoolExecutor(max_workers=args.threads) as executor:
         futures = {
-            executor.submit(scan_target, t, args.port, args.timeout, args.modules, not args.no_deep): t
+            executor.submit(scan_target, t, args.port, args.timeout, args.modules,
+                            not args.no_deep, saml_review): t
             for t in targets
         }
         for future in as_completed(futures):
@@ -2206,20 +2425,29 @@ def main():
                 results.append(result)
                 print_result(result, verbose=args.verbose)
             except Exception as e:
+                failed_targets.append(futures[future])
                 print(f"[!] Error scanning {futures[future]}: {e}", file=sys.stderr)
 
     risk_order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4, "UNKNOWN": 5}
     results.sort(key=lambda r: risk_order.get(r.risk_rating, 5))
 
-    print_summary(results)
+    print_summary(results, failed_targets, len(targets))
 
-    if args.output_json:
-        export_json(results, args.output_json)
-    if args.output_csv:
-        export_csv(results, args.output_csv)
-    if args.output_md:
-        export_markdown(results, args.output_md)
+    try:
+        if args.output_json:
+            export_json(results, args.output_json, args.modules, failed_targets,
+                        len(targets), saml_review)
+        if args.output_csv:
+            export_csv(results, args.output_csv, failed_targets, saml_review)
+        if args.output_md:
+            export_markdown(results, args.output_md, failed_targets, len(targets), saml_review)
+    except OSError as e:
+        print(f"[!] Could not write report: {e}", file=sys.stderr)
+        return 1
+
+    return determine_exit_code(results, failed_targets, args.fail_on_risk,
+                               args.fail_on_saml_match, saml_review)
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
