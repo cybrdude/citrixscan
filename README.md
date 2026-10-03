@@ -129,18 +129,18 @@ Detects the Endpoint Analysis client (`nsepa_setup.exe`) and, unless `--no-deep`
 
 ### Additional Clues
 
-The report retains ETags, stock login page hashes, TLS certificate names, and a `?v=` asset token when present. A corpus made with `firmware_corpus.py` can match a stock GZIP timestamp or token to **all** builds that share it. A corpus match is a served-resource build candidate even if only one package matches. Plugin versions like `25.5.x.x` in `pluginlist.xml` are not firmware versions. The JSON report marks external patch state as unverified and retains each version source and its confidence.
+The report retains ETag hashes, stock login page hashes, TLS certificate names, and a `?v=` asset token when present. A corpus made with `firmware_corpus.py` can match a stock GZIP timestamp or token to **all** builds that share it. A corpus match is a served-resource build candidate even if only one package matches. Plugin versions like `25.5.x.x` in `pluginlist.xml` are not firmware versions. The JSON report marks external patch state as unverified and retains each version source and its confidence.
 
 ### What If Version Can't Be Determined?
 
-Some hardened appliances gate every resource path (including static files) behind authentication. When this happens, CitrixScan provides detailed diagnostics explaining exactly which paths were tried and what each returned, along with actionable guidance:
+Some hardened appliances gate resource paths (including static files) behind authentication. When this happens, CitrixScan retains bounded GZIP probe diagnostics and owner-side verification guidance:
 
 ```
 VERSION UNKNOWN: Authenticate and run 'show ns version' to confirm patch status.
+  → CVE-2026-88771 patch status is unknown. Verify the build and edition against CTX697096 immediately.
   → Fingerprint diagnostic: rdx_en.json.gz — GZIP valid but MTIME=0 (timestamp stripped)
-  → Configuration signal observed; confirm the current build and edition.
-  → Publicly served files and client plugins cannot verify the running build.
-  → Or query the authenticated NITRO nsversion API on the management IP.
+  → Gateway or authentication features are visible; prioritize owner-side version and configuration review.
+  → Confirm the running build and edition on every node with 'show ns version' or authenticated NITRO on the management network.
 ```
 
 ### Resolving uncertain patch status
